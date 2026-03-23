@@ -1,0 +1,12 @@
+# 运行日志（见 Nothing/log/runtime_logging.py）
+Nothing/log/*.log
+Nothing/log/*.log.*
+log/
+
+.venv/
+Nothing/.venv/
+__pycache__/
+__py/
+
+Nothing/out/
+out/
