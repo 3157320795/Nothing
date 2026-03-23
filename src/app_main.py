@@ -95,6 +95,12 @@ def run_cli(argv: list[str] | None = None) -> int:
         help="保存目录（默认 Nothing/out/novel）",
     )
     parser.add_argument("--no-save", action="store_true", help="仅打印，不落盘保存")
+    parser.add_argument(
+        "--theme",
+        choices=["night", "day"],
+        default="night",
+        help="GUI 主题：night=黑夜（当前配色），day=白天（全局反色）",
+    )
     gui_group = parser.add_mutually_exclusive_group()
     gui_group.add_argument("--gui", dest="gui", action="store_true", help="启动 GUI 界面交互（默认）")
     gui_group.add_argument("--no-gui", dest="gui", action="store_false", help="关闭 GUI，使用命令行模式")
@@ -108,7 +114,7 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     try:
         if args.gui:
-            return gui_app(out_dir=out_dir, prefer_redirect=prefer_redirect, save=save)
+            return gui_app(out_dir=out_dir, prefer_redirect=prefer_redirect, save=save, theme=args.theme)
 
         # 交互模式：不传 name 时启用
         if not args.name:

@@ -38,7 +38,7 @@ from video.bilibili_direct import parse_bilibili_minimal, UA
 from video.ffmpeg_tk_embed import FfmpegTkEmbedPlayer
 
 
-def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -> int:
+def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, theme: str = "night") -> int:
     try:
         import tkinter as tk
         import tkinter.colorchooser as colorchooser
@@ -66,11 +66,123 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
     root.title("小说下载/阅读")
     root.geometry("1200x780")
 
-    UI_BG = "#181818"
-    UI_FG = "#FFFFFF"
-    UI_ACTIVE_BG = "#181818"
-    UI_SEL_BG = "#2A2A2A"
-    UI_SEL_FG = "#FFFFFF"
+    is_day_theme = str(theme or "").strip().lower() == "day"
+    if is_day_theme:
+        # 白天模式：在当前黑底白字的基础上做全局反色。
+        UI_BG = "#FFFFFF"
+        UI_FG = "#181818"
+        UI_ACTIVE_BG = "#FFFFFF"
+        UI_SEL_BG = "#E6E6E6"
+        UI_SEL_FG = "#181818"
+    else:
+        UI_BG = "#181818"
+        UI_FG = "#FFFFFF"
+        UI_ACTIVE_BG = "#181818"
+        UI_SEL_BG = "#2A2A2A"
+        UI_SEL_FG = "#FFFFFF"
+
+    style_holder: dict[str, Any] = {"style": None}
+
+    def _set_ui_theme(mode: str) -> None:
+        nonlocal UI_BG, UI_FG, UI_ACTIVE_BG, UI_SEL_BG, UI_SEL_FG
+        if str(mode or "").strip().lower() == "day":
+            UI_BG = "#FFFFFF"
+            UI_FG = "#181818"
+            UI_ACTIVE_BG = "#FFFFFF"
+            UI_SEL_BG = "#E6E6E6"
+            UI_SEL_FG = "#181818"
+        else:
+            UI_BG = "#181818"
+            UI_FG = "#FFFFFF"
+            UI_ACTIVE_BG = "#181818"
+            UI_SEL_BG = "#2A2A2A"
+            UI_SEL_FG = "#FFFFFF"
+
+    def _apply_ttk_theme() -> None:
+        style = style_holder.get("style")
+        if style is None:
+            return
+        try:
+            style.configure(".", background=UI_BG, foreground=UI_FG)
+            style.configure("TFrame", background=UI_BG)
+            style.configure("TLabel", background=UI_BG, foreground=UI_FG)
+            style.configure("TNotebook", background=UI_BG, borderwidth=0)
+            style.configure("TNotebook.Tab", background=UI_BG, foreground=UI_FG, padding=[10, 6], borderwidth=0)
+            style.map(
+                "TNotebook.Tab",
+                background=[("selected", UI_BG), ("active", UI_BG)],
+                foreground=[("selected", UI_FG), ("active", UI_FG)],
+            )
+            style.configure("TButton", background=UI_BG, foreground=UI_FG, borderwidth=0, focusthickness=0)
+            style.map(
+                "TButton",
+                background=[("active", UI_BG), ("pressed", UI_BG)],
+                foreground=[("active", UI_FG), ("pressed", UI_FG)],
+            )
+            style.configure(
+                "Treeview",
+                background=UI_BG,
+                foreground=UI_FG,
+                fieldbackground=UI_BG,
+                borderwidth=0,
+                rowheight=24,
+            )
+            style.configure("Treeview.Heading", background=UI_BG, foreground=UI_FG)
+            style.map(
+                "Treeview",
+                background=[("selected", UI_SEL_BG)],
+                foreground=[("selected", UI_SEL_FG)],
+            )
+        except Exception:
+            pass
+
+    def _apply_theme_to_widget_tree(widget: Any) -> None:
+        cls = str(widget.winfo_class())
+        try:
+            if cls in {"Frame", "Toplevel", "Panedwindow", "Canvas"}:
+                widget.configure(bg=UI_BG)
+            elif cls == "Label":
+                widget.configure(bg=UI_BG, fg=UI_FG)
+            elif cls in {"Entry", "Spinbox"}:
+                widget.configure(
+                    bg=UI_BG,
+                    fg=UI_FG,
+                    insertbackground=UI_FG,
+                    highlightbackground=UI_BG,
+                    highlightcolor=UI_BG,
+                )
+            elif cls == "Text":
+                widget.configure(bg=UI_BG, fg=UI_FG, insertbackground=UI_FG)
+            elif cls == "Listbox":
+                widget.configure(
+                    bg=UI_BG,
+                    fg=UI_FG,
+                    selectbackground=UI_SEL_BG,
+                    selectforeground=UI_SEL_FG,
+                    highlightbackground=UI_BG,
+                    highlightcolor=UI_BG,
+                )
+            elif cls == "Scale":
+                widget.configure(
+                    bg=UI_BG,
+                    fg=UI_FG,
+                    activebackground=UI_BG,
+                    troughcolor=UI_BG,
+                    highlightthickness=0,
+                )
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            _apply_theme_to_widget_tree(child)
+
+    def _apply_theme_to_all(theme_mode: str) -> None:
+        _set_ui_theme(theme_mode)
+        try:
+            root.configure(bg=UI_BG)
+        except Exception:
+            pass
+        _apply_ttk_theme()
+        _apply_theme_to_widget_tree(root)
 
     root.configure(bg=UI_BG)
     # 普通模式也启用无边框（自绘移动/缩放）
@@ -266,33 +378,104 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
     topbar.place(x=0, y=0, relwidth=1.0, height=MOVE_AREA_H)
     tk.Label(topbar, text="小说下载/阅读", bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=10)
     # macOS 下 tk.Button 可能忽略 bg 显示为白色，这里用 Label 自绘按钮保证背景一致
-    close_btn = tk.Label(topbar, text="×", bg=UI_BG, fg=UI_FG, padx=12, pady=6)
+    close_btn = tk.Label(
+        topbar,
+        text="×",
+        bg=UI_BG,
+        fg=UI_FG,
+        padx=12,
+        pady=6,
+        bd=1,
+        relief="solid",
+        highlightthickness=0,
+    )
     close_btn.pack(side=tk.RIGHT, padx=6)
+    # 主题开关固定在关闭按钮左侧，显示为滑动开关（亮/暗）
+    theme_switch = tk.Canvas(
+        topbar,
+        width=78,
+        height=24,
+        bg=UI_BG,
+        bd=0,
+        highlightthickness=0,
+    )
+    theme_switch.pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _render_theme_switch(*, hover: bool = False) -> None:
+        try:
+            theme_switch.delete("all")
+        except Exception:
+            return
+        mode = str(app_state.get("theme_mode") or "night").lower()
+        is_night = mode == "night"
+        track_bg = "#3A3A3A" if is_night else "#D9D9D9"
+        if hover:
+            track_bg = "#4A4A4A" if is_night else "#CFCFCF"
+        knob_fill = "#FFFFFF" if is_night else "#181818"
+        text_color = "#FFFFFF" if is_night else "#181818"
+
+        theme_switch.create_rectangle(1, 1, 77, 23, outline=UI_FG, width=1, fill=track_bg)
+        if is_night:
+            theme_switch.create_oval(53, 3, 73, 21, fill=knob_fill, outline=knob_fill)
+            theme_switch.create_text(20, 12, text="暗", fill=text_color, font=("TkDefaultFont", 10, "bold"))
+        else:
+            theme_switch.create_oval(5, 3, 25, 21, fill=knob_fill, outline=knob_fill)
+            theme_switch.create_text(58, 12, text="亮", fill=text_color, font=("TkDefaultFont", 10, "bold"))
 
     def _close_hover(_e: Any) -> None:
-        close_btn.configure(bg=UI_BG)
+        close_btn.configure(bg=UI_SEL_BG, fg=UI_SEL_FG)
 
     def _close_leave(_e: Any) -> None:
-        close_btn.configure(bg=UI_BG)
+        close_btn.configure(bg=UI_BG, fg=UI_FG)
+
+    def _theme_hover(_e: Any) -> None:
+        _render_theme_switch(hover=True)
+
+    def _theme_leave(_e: Any) -> None:
+        _render_theme_switch(hover=False)
 
     def _close_click(_e: Any) -> None:
         _close_app()
 
+    def _toggle_theme_click(_e: Any = None) -> None:
+        cur = str(app_state.get("theme_mode") or "night").lower()
+        nxt = "day" if cur == "night" else "night"
+        app_state["theme_mode"] = nxt
+        _apply_theme_to_all(nxt)
+        _render_theme_switch()
+        try:
+            set_status("已切换主题：" + ("白天" if nxt == "day" else "黑夜"))
+        except Exception:
+            pass
+
     close_btn.bind("<Enter>", _close_hover)
     close_btn.bind("<Leave>", _close_leave)
     close_btn.bind("<Button-1>", _close_click)
+    theme_switch.bind("<Enter>", _theme_hover)
+    theme_switch.bind("<Leave>", _theme_leave)
+    theme_switch.bind("<Button-1>", _toggle_theme_click)
 
     def _make_flat_button(parent: Any, text: str, command: Any) -> Any:
         """
         使用 Label 自绘按钮，避免 macOS 下 tk.Button 忽略 bg 导致白底。
         """
-        w = tk.Label(parent, text=text, bg=UI_BG, fg=UI_FG, padx=10, pady=6)
+        w = tk.Label(
+            parent,
+            text=text,
+            bg=UI_BG,
+            fg=UI_FG,
+            padx=10,
+            pady=6,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+        )
 
         def _enter(_e: Any) -> None:
-            w.configure(bg=UI_SEL_BG)
+            w.configure(bg=UI_SEL_BG, fg=UI_SEL_FG)
 
         def _leave(_e: Any) -> None:
-            w.configure(bg=UI_BG)
+            w.configure(bg=UI_BG, fg=UI_FG)
 
         def _click(_e: Any) -> None:
             try:
@@ -324,6 +507,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
         "fund_uid_counter": 1,
         "fund_refresh_job": None,
         "fund_refresh_running": False,
+        "theme_mode": "day" if is_day_theme else "night",
     }
 
     # ======================
@@ -421,6 +605,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
     # 这里切到 clam 并把常用 ttk 样式统一覆盖为 #181818 + 白字
     try:
         style = ttk.Style()
+        style_holder["style"] = style
         try:
             style.theme_use("clam")
         except Exception:
@@ -1036,10 +1221,10 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
     video_main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
     video_list_holder = tk.Frame(video_main, bg=UI_BG, bd=0, highlightthickness=0)
-    video_main.add(video_list_holder, minsize=360)
+    video_main.add(video_list_holder, minsize=430)
 
     player_holder = tk.Frame(video_main, bg=UI_BG, bd=0, highlightthickness=0)
-    video_main.add(player_holder, minsize=620)
+    video_main.add(player_holder, minsize=540)
 
     video_canvas = tk.Canvas(video_list_holder, bg=UI_BG, bd=0, highlightthickness=0)
 
@@ -1047,6 +1232,13 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
 
     video_list_frame = tk.Frame(video_canvas, bg=UI_BG, bd=0, highlightthickness=0)
     video_window_id = video_canvas.create_window((0, 0), window=video_list_frame, anchor="nw")
+    video_canvas.bind(
+        "<Configure>",
+        lambda e: (
+            video_canvas.itemconfigure(video_window_id, width=max(1, int(getattr(e, "width", 1)))),
+            _refresh_video_scrollregion(),
+        ),
+    )
 
     def _refresh_video_scrollregion() -> None:
         try:
@@ -1562,14 +1754,12 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
             tk.Label(video_list_frame, text="暂无视频结果", bg=UI_BG, fg=UI_FG).pack(anchor="w", padx=6, pady=10)
             return
 
-        CARD_W = 330
-        CARD_PAD_X = 8
         COVER_W, COVER_H = THUMB_W, THUMB_H
 
         # 纵向列表：Canvas 高度由内容+滚动条决定，不强行固定高度
 
         for idx, item in enumerate(videos):
-            card = tk.Frame(video_list_frame, bg=UI_BG, bd=0, highlightthickness=0, width=CARD_W)
+            card = tk.Frame(video_list_frame, bg=UI_BG, bd=0, highlightthickness=0)
             card.pack(side=tk.TOP, fill=tk.X, padx=10, pady=6)
 
             # 用 Frame 固定封面像素高度（Label.height 是“行数”容易造成异常）
@@ -1587,23 +1777,23 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
             )
             cover_label.pack(fill=tk.BOTH, expand=True)
 
+            # 每条视频单独提供播放按钮：播放对应 url
+            _make_flat_button(
+                card,
+                "跳转",
+                lambda _it=item: (_select_video(_it), _open_video(_it.url)),
+            ).pack(side=tk.RIGHT, padx=6, pady=0)
+
             title_label = tk.Label(
                 card,
                 bg=UI_BG,
                 fg=UI_FG,
                 text=item.title,
-                wraplength=180,
+                wraplength=220,
                 justify="left",
                 anchor="w",
             )
-            title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-            # 每条视频单独提供播放按钮：播放对应 url
-            _make_flat_button(
-                card,
-                "播放",
-                lambda _it=item: (_select_video(_it), _open_video(_it.url)),
-            ).pack(side=tk.RIGHT, padx=6, pady=0)
+            title_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
             def _on_click(_e: Any = None, *, _item: VideoItem = item) -> None:
                 _select_video(_item)
@@ -2104,13 +2294,13 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
     # ------------------------------------------------------------------
     # 阅读：浏览本地 reader/content，黑底白字逐章阅读
     # ------------------------------------------------------------------
-    reader_tab.configure(bg="#181818", bd=0, highlightthickness=0)
+    reader_tab.configure(bg=UI_BG, bd=0, highlightthickness=0)
     try:
-        reader_tab.master.configure(bg="#181818")
+        reader_tab.master.configure(bg=UI_BG)
     except Exception:
         pass
 
-    read_top = tk.Frame(reader_tab, bg="#181818", bd=0, highlightthickness=0)
+    read_top = tk.Frame(reader_tab, bg=UI_BG, bd=0, highlightthickness=0)
     read_top.pack(side=tk.TOP, fill=tk.X, padx=12, pady=12)
 
     tk.Label(read_top, text="本地小说:", fg=UI_FG, bg=UI_BG).pack(side=tk.LEFT)
@@ -2246,11 +2436,11 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
     ).pack(side=tk.LEFT, padx=(8, 0))
 
     # PanedWindow 不支持 highlightthickness 参数
-    read_mid = tk.PanedWindow(reader_tab, orient=tk.HORIZONTAL, sashrelief=tk.FLAT, bg="#181818", bd=0)
+    read_mid = tk.PanedWindow(reader_tab, orient=tk.HORIZONTAL, sashrelief=tk.FLAT, bg=UI_BG, bd=0)
     read_mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
-    read_left = tk.Frame(read_mid, bg="#181818", bd=0, highlightthickness=0)
-    read_right = tk.Frame(read_mid, bg="#181818", bd=0, highlightthickness=0)
+    read_left = tk.Frame(read_mid, bg=UI_BG, bd=0, highlightthickness=0)
+    read_right = tk.Frame(read_mid, bg=UI_BG, bd=0, highlightthickness=0)
     read_mid.add(read_left, minsize=360)
     read_mid.add(read_right, minsize=760)
 
@@ -2606,7 +2796,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
     root.bind("<KeyPress>", on_key)
 
     # （移除：阅读页 UI 显示开关逻辑）
-    read_actions = tk.Frame(read_top, bg="#181818", bd=0, highlightthickness=0)
+    read_actions = tk.Frame(read_top, bg=UI_BG, bd=0, highlightthickness=0)
     read_actions.pack(side=tk.RIGHT)
     # 阅读模式按钮底色统一为黑色
     # macOS 下 tk.Button 可能忽略 bg，这里统一用自绘按钮保证颜色一致
@@ -2620,6 +2810,8 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True) -
 
     # 初始化
     set_root_alpha(1.0)
+    _apply_theme_to_all(str(app_state.get("theme_mode") or "night"))
+    _render_theme_switch()
     # apply_read_bg(read_alpha.get())
     # apply_read_font()
     refresh_local_library()
