@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import html
+import re
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any
@@ -37,6 +39,12 @@ def _extract_bvid_url(*, bvid: str, short_link_v2: str | None = None) -> str:
     if short_link_v2:
         return short_link_v2
     return ""
+
+
+def _clean_html_title(raw_title: str) -> str:
+    # 搜索接口标题经常带 <em class="keyword"> 高亮标记，这里统一清洗。
+    text = re.sub(r"<[^>]+>", "", raw_title or "")
+    return html.unescape(text).strip()
 
 
 def _print_full_debug(prefix: str, raw: bytes, *, max_chars: int = 100) -> None:
@@ -182,10 +190,24 @@ def bilibili_search_videos(
         return []
 
     query = {
-        "keyword": keyword,
+        "__refresh__": "true",
+        "_extra": "",
+        "context": "",
         "page": page,
         "page_size": page_size,
         "order": order,
+        "pubtime_begin_s": 0,
+        "pubtime_end_s": 0,
+        "duration": "",
+        "from_source": "",
+        "from_spmid": "333.337",
+        "platform": "pc",
+        "highlight": 1,
+        "single_column": 0,
+        "keyword": keyword,
+        "ad_resource": "5646",
+        "source_tag": "3",
+        "web_roll_page": 1,
     }
     qs = urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
     url = f"https://api.bilibili.com/x/web-interface/search/all/v2?{qs}"
@@ -222,10 +244,12 @@ def bilibili_search_videos(
     for it in video_results:
         if not isinstance(it, dict):
             continue
-        title = str(it.get("title") or "").strip()
+        title = _clean_html_title(str(it.get("title") or ""))
         bvid = str(it.get("bvid") or "").strip()
         pic = _normalize_pic_url(str(it.get("pic") or ""))
-        url2 = _extract_bvid_url(bvid=bvid, short_link_v2=it.get("short_link_v2")) or str(it.get("arcurl") or "").strip()
+        url2 = str(it.get("arcurl") or "").strip() or _extract_bvid_url(
+            bvid=bvid, short_link_v2=it.get("short_link_v2")
+        )
         if title and pic and url2:
             out.append(VideoItem(bvid=bvid, title=title, pic=pic, url=url2))
     return out

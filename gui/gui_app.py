@@ -1782,6 +1782,12 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
         COVER_W, COVER_H = THUMB_W, THUMB_H
 
+        def _truncate_title(text: str, max_len: int = 20) -> str:
+            s = str(text or "").strip()
+            if len(s) <= max_len:
+                return s
+            return s[:max_len] + "..."
+
         # 纵向列表：Canvas 高度由内容+滚动条决定，不强行固定高度
 
         for idx, item in enumerate(videos):
@@ -1810,16 +1816,33 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                 lambda _it=item: (_select_video(_it), _open_video(_it.url)),
             ).pack(side=tk.RIGHT, padx=6, pady=0)
 
+            info_holder = tk.Frame(card, bg=UI_BG, bd=0, highlightthickness=0)
+            info_holder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+
             title_label = tk.Label(
-                card,
+                info_holder,
                 bg=UI_BG,
                 fg=UI_FG,
-                text=item.title,
+                text=_truncate_title(item.title, 20),
                 wraplength=220,
                 justify="left",
-                anchor="w",
+                anchor="nw",
             )
-            title_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+            title_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            def _on_card_resize(e: Any, *, _label: Any = title_label) -> None:
+                # 动态按卡片宽度给标题分配可用区域，避免横向裁剪。
+                try:
+                    card_w = int(getattr(e, "width", 0) or 0)
+                    text_w = max(100, card_w - COVER_W - 90)
+                    _label.configure(wraplength=text_w)
+                except Exception:
+                    pass
+
+            try:
+                card.bind("<Configure>", _on_card_resize)
+            except Exception:
+                pass
 
             def _on_click(_e: Any = None, *, _item: VideoItem = item) -> None:
                 _select_video(_item)
@@ -1831,7 +1854,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                     pass
 
             # 让鼠标滚轮在卡片区域也能工作（避免光标不在 Canvas 上时不触发）
-            for w in (card, cover_box, cover_label, title_label):
+            for w in (card, cover_box, cover_label, info_holder, title_label):
                 try:
                     w.bind("<MouseWheel>", _wheel_scroll)
                     w.bind("<Button-4>", _btn4)
@@ -2034,6 +2057,11 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     video_search_label.pack(side=tk.LEFT)
     video_keyword_entry.pack(side=tk.LEFT, padx=(8, 12))
     search_btn.pack(side=tk.LEFT, padx=6)
+
+    try:
+        video_keyword_entry.bind("<Return>", lambda _e: _on_search_clicked())
+    except Exception:
+        pass
 
     # 初始化：默认加载热门
     _on_hot_clicked()
