@@ -1189,7 +1189,19 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     # ------------------------------------------------------------------
     # 视频：热门 / 搜索 + 左侧列表（纵向滚动）+ 右侧播放器区
     # ------------------------------------------------------------------
-    video_state: dict[str, Any] = {"token": 0, "embed_player": None, "play_generation": 0}
+    video_state: dict[str, Any] = {
+        "token": 0,
+        "embed_player": None,
+        "play_generation": 0,
+        "mode": "hot",  # hot | search
+        "page": 1,
+        "page_size": 20,
+        "keyword": "",
+        "loading_more": False,
+        "has_more": True,
+        "videos": [],
+        "auto_loading_queued": False,
+    }
     video_cover_cache: dict[str, Any] = {}  # 保持 PhotoImage 引用，避免被 GC
 
     video_top = tk.Frame(video_tab, bg=UI_BG, bd=0, highlightthickness=0)
@@ -1263,6 +1275,8 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
             step = 0
         if step != 0:
             video_canvas.yview_scroll(step, "units")
+            if step > 0:
+                root.after(0, _try_auto_load_more_videos)
         return "break"
 
     def _btn4(_e: Any) -> str:
@@ -1271,6 +1285,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
     def _btn5(_e: Any) -> str:
         video_canvas.yview_scroll(1, "units")
+        root.after(0, _try_auto_load_more_videos)
         return "break"
 
     video_canvas.bind("<MouseWheel>", _wheel_scroll)
@@ -1745,12 +1760,23 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         pass
     play_btn.pack(side=tk.TOP, padx=10, pady=(0, 14))
 
-    def _render_videos(videos: list[VideoItem]) -> None:
-        # 刷新列表（热门/搜索）时停止当前播放，避免旧画面残留
-        _stop_embedded_video(restore_cover=True)
-        _clear_video_list()
+    def _is_video_list_near_bottom() -> bool:
+        try:
+            top, bottom = video_canvas.yview()
+        except Exception:
+            return False
+        return bottom >= 0.995
 
-        if not videos:
+    def _render_videos(videos: list[VideoItem], *, append: bool = False) -> None:
+        # 非追加模式：刷新列表时停止当前播放，避免旧画面残留
+        if not append:
+            _stop_embedded_video(restore_cover=True)
+            _clear_video_list()
+            video_state["videos"] = list(videos)
+        else:
+            video_state["videos"] = list(video_state.get("videos") or []) + list(videos)
+
+        if not videos and not append:
             tk.Label(video_list_frame, text="暂无视频结果", bg=UI_BG, fg=UI_FG).pack(anchor="w", padx=6, pady=10)
             return
 
@@ -1874,8 +1900,8 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
             threading.Thread(target=_load_cover_worker, daemon=True).start()
 
-        # 默认选中第一条，让播放器区立刻有内容
-        if videos:
+        # 仅在“首屏加载”时默认选中第一条，避免翻页时打断当前选择
+        if videos and not append:
             try:
                 _select_video(videos[0])
             except Exception:
@@ -1883,32 +1909,114 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
         _refresh_video_scrollregion()
 
-    def _fetch_and_render(fetch_fn: Any, *, set_key: str = "", **kwargs: Any) -> None:
+    def _fetch_and_render(fetch_fn: Any, *, append: bool = False, **kwargs: Any) -> None:
         video_state["token"] = int(video_state.get("token") or 0) + 1
         token = int(video_state["token"])
-        set_status("视频加载中...")
+        set_status("视频加载中..." if not append else "加载下一页中...")
 
         def worker() -> None:
             try:
                 videos: list[VideoItem] = fetch_fn(**kwargs)
-                root.after(0, lambda: (_render_videos(videos), set_status(f"视频加载完成（共 {len(videos)} 条）")))
+                def _apply() -> None:
+                    if int(video_state.get("token") or 0) != token:
+                        return
+                    _render_videos(videos, append=append)
+                    if append:
+                        video_state["loading_more"] = False
+                        video_state["auto_loading_queued"] = False
+                        page_size = int(video_state.get("page_size") or 20)
+                        video_state["has_more"] = len(videos) >= page_size
+                        set_status(
+                            f"第 {int(video_state.get('page') or 1)} 页加载完成，新增 {len(videos)} 条（累计 {len(video_state.get('videos') or [])} 条）"
+                        )
+                    else:
+                        page_size = int(video_state.get("page_size") or 20)
+                        video_state["has_more"] = len(videos) >= page_size
+                        set_status(f"视频加载完成（共 {len(videos)} 条）")
+                root.after(0, _apply)
             except Exception as e:  # noqa: BLE001
                 if int(video_state.get("token") or 0) != token:
                     return
                 err_msg = str(e)
-                root.after(0, lambda err_msg=err_msg: set_status(f"视频加载失败: {err_msg}"))
+                def _apply_err(err_msg: str = err_msg) -> None:
+                    if append:
+                        video_state["loading_more"] = False
+                        video_state["auto_loading_queued"] = False
+                        # 回滚页码，避免“跳页”
+                        video_state["page"] = max(1, int(video_state.get("page") or 1) - 1)
+                    set_status(f"视频加载失败: {err_msg}")
+                root.after(0, _apply_err)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _load_next_video_page() -> None:
+        if video_state.get("loading_more"):
+            return
+        if not video_state.get("has_more", True):
+            return
+        video_state["loading_more"] = True
+        video_state["page"] = int(video_state.get("page") or 1) + 1
+        page = int(video_state["page"])
+        page_size = int(video_state.get("page_size") or 20)
+        mode = str(video_state.get("mode") or "hot")
+        if mode == "search":
+            kw = str(video_state.get("keyword") or "").strip()
+            if not kw:
+                video_state["loading_more"] = False
+                return
+            _fetch_and_render(
+                bilibili_search_videos,
+                append=True,
+                keyword=kw,
+                page=page,
+                page_size=page_size,
+                order="general",
+            )
+        else:
+            _fetch_and_render(
+                bilibili_hot_videos_fetch,
+                append=True,
+                page=page,
+                page_size=page_size,
+            )
+
+    def _try_auto_load_more_videos() -> None:
+        if video_state.get("auto_loading_queued"):
+            return
+        if video_state.get("loading_more"):
+            return
+        if not _is_video_list_near_bottom():
+            return
+        video_state["auto_loading_queued"] = True
+        _load_next_video_page()
+
     def _on_hot_clicked() -> None:
-        _fetch_and_render(bilibili_hot_videos_fetch)
+        video_state["mode"] = "hot"
+        video_state["page"] = 1
+        video_state["keyword"] = ""
+        video_state["loading_more"] = False
+        video_state["auto_loading_queued"] = False
+        video_state["has_more"] = True
+        _fetch_and_render(bilibili_hot_videos_fetch, page=1, page_size=int(video_state.get("page_size") or 20))
 
     def _on_search_clicked() -> None:
         kw = (video_keyword_var.get() or "").strip()
         if not kw:
             set_status("请输入视频关键词。")
             return
-        _fetch_and_render(bilibili_search_videos, keyword=kw, page=1, page_size=20, order="general")
+        video_state["mode"] = "search"
+        video_state["page"] = 1
+        video_state["keyword"] = kw
+        video_state["loading_more"] = False
+        video_state["auto_loading_queued"] = False
+        video_state["has_more"] = True
+        _fetch_and_render(
+            bilibili_search_videos,
+            keyword=kw,
+            page=1,
+            page_size=int(video_state.get("page_size") or 20),
+            order="general",
+        )
 
     # 顶部按钮：用统一的 Label 自绘样式
     # 互换“热门按钮”和“搜索栏”位置：热门在左侧，搜索栏在其右侧

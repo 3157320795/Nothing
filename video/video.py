@@ -11,8 +11,6 @@ from src.common import BiqugeError, http_get
 DEFAULT_BILIBILI_POPULAR_URL = (
     "https://api.bilibili.com/x/web-interface/popular"
     "?ps=20&pn=1&web_location=333.934"
-    "&w_rid=4ae31c690e07def2dfc2133cfbe7cf2b"
-    "&wts=1773993397"
 )
 
 
@@ -104,7 +102,9 @@ def _robust_json_loads(raw: bytes, *, context: str) -> Any:
 
 
 def bilibili_hot_videos_fetch(
-    full_url: str = DEFAULT_BILIBILI_POPULAR_URL,
+    full_url: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
     *,
     debug_print_payload_on_error: bool = True,
 ) -> list[VideoItem]:
@@ -117,7 +117,23 @@ def bilibili_hot_videos_fetch(
     - bvid：视频 BV 号（用于生成 url）
     """
 
-    raw = http_get(full_url, headers={"Accept": "application/json", "Referer": "https://www.bilibili.com/"})
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 20
+
+    if full_url:
+        url = full_url
+    else:
+        query = {
+            "ps": page_size,
+            "pn": page,
+            "web_location": "333.934",
+        }
+        qs = urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
+        url = f"https://api.bilibili.com/x/web-interface/popular?{qs}"
+
+    raw = http_get(url, headers={"Accept": "application/json", "Referer": "https://www.bilibili.com/"})
     payload = _robust_json_loads(raw, context="hot")
 
     if int(payload.get("code", -1)) != 0:
