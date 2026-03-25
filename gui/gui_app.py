@@ -5,7 +5,10 @@ import json
 import logging
 import os
 import re
+import signal
+import socket
 import subprocess
+import uuid
 import tempfile
 import threading
 import time
@@ -454,6 +457,10 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         _apply_theme_to_all(nxt)
         try:
             _redraw_fund_history_if_loaded()
+        except Exception:
+            pass
+        try:
+            _music_art_draw_frame()
         except Exception:
             pass
         _render_theme_switch()
@@ -2116,11 +2123,24 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         "selected_id": 0,
         "auto_loading_queued": False,
         "sel_token": 0,
+        "art_angle": 0.0,
+        "art_progress": 0.0,
+        "art_playing": False,
+        "art_indeterminate": False,
+        "art_indet_phase": 0.0,
+        "art_rotate_after": None,
+        "art_pil_rgba": None,
+        "art_photo": None,
+        "art_placeholder": "在左侧选择歌曲",
+        "mpv_ipc_sock": None,
+        "mpv_poll_stop": None,
+        "playback_paused": False,
     }
     music_cover_cache: dict[str, Any] = {}
 
     MUSIC_THUMB_W, MUSIC_THUMB_H = 64, 64
     MUSIC_PANEL_W, MUSIC_PANEL_H = 360, 360
+    MUSIC_RING_W = 7
 
     music_top = tk.Frame(music_tab, bg=UI_BG, bd=0, highlightthickness=0)
     music_top.pack(side=tk.TOP, fill=tk.X, padx=12, pady=12)
@@ -2211,16 +2231,326 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     music_cover_box.pack_propagate(False)
     music_cover_box.pack(side=tk.TOP, padx=10, pady=(8, 10))
 
-    music_cover_label = tk.Label(
+    music_art_canvas = tk.Canvas(
         music_cover_box,
+        width=MUSIC_PANEL_W,
+        height=MUSIC_PANEL_H,
         bg=UI_BG,
-        fg=UI_FG,
-        text="在左侧选择歌曲",
-        anchor="center",
-        justify="center",
-        wraplength=MUSIC_PANEL_W - 20,
+        highlightthickness=0,
+        bd=0,
     )
-    music_cover_label.pack(fill=tk.BOTH, expand=True)
+    music_art_canvas.pack(fill=tk.BOTH, expand=True)
+    try:
+        music_art_canvas.configure(cursor="hand2")
+    except Exception:
+        pass
+
+    def _music_art_theme_colors() -> tuple[str, str]:
+        is_day = str(app_state.get("theme_mode") or "night").lower() == "day"
+        track = "#D8D8D8" if is_day else "#3D3D3D"
+        prog = "#1F6FEB" if is_day else "#6EB5FF"
+        return track, prog
+
+    def _music_art_cancel_tick() -> None:
+        aid = music_state.get("art_rotate_after")
+        if aid is not None:
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+            music_state["art_rotate_after"] = None
+
+    def _pil_circle_rotated_disc(src_rgba: Any, angle: float, out_size: int) -> Any:
+        from PIL import Image, ImageDraw
+
+        im = src_rgba.resize((out_size, out_size), getattr(Image, "LANCZOS", Image.BICUBIC))
+        im = im.rotate(-float(angle), resample=Image.BICUBIC, expand=True)
+        w, h = im.size
+        left = (w - out_size) // 2
+        top = (h - out_size) // 2
+        im = im.crop((left, top, left + out_size, top + out_size))
+        mask = Image.new("L", (out_size, out_size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, out_size - 1, out_size - 1), fill=255)
+        im.putalpha(mask)
+        return im
+
+    def _music_art_draw_frame() -> None:
+        try:
+            c = music_art_canvas
+            c.update_idletasks()
+            cw = max(MUSIC_PANEL_W, int(c.winfo_width() or MUSIC_PANEL_W))
+            ch = max(MUSIC_PANEL_H, int(c.winfo_height() or MUSIC_PANEL_H))
+        except Exception:
+            cw, ch = MUSIC_PANEL_W, MUSIC_PANEL_H
+        cx, cy = cw // 2, ch // 2
+        pad = 10
+        x1, y1, x2, y2 = pad, pad, cw - pad, ch - pad
+        track_c, prog_c = _music_art_theme_colors()
+        playing = bool(music_state.get("art_playing"))
+        paused = bool(music_state.get("playback_paused"))
+        if playing and not paused:
+            music_state["art_angle"] = (float(music_state.get("art_angle") or 0) + 2.0) % 360.0
+
+        try:
+            c.delete("all")
+        except Exception:
+            return
+
+        c.create_arc(
+            x1,
+            y1,
+            x2,
+            y2,
+            start=0,
+            extent=359.9,
+            outline=track_c,
+            width=MUSIC_RING_W,
+            style=tk.ARC,
+        )
+        if bool(music_state.get("art_indeterminate")) and playing and not paused:
+            ph = float(music_state.get("art_indet_phase") or 0) + 5.5
+            ph %= 360.0
+            music_state["art_indet_phase"] = ph
+            c.create_arc(
+                x1,
+                y1,
+                x2,
+                y2,
+                start=ph,
+                extent=-78,
+                outline=prog_c,
+                width=MUSIC_RING_W,
+                style=tk.ARC,
+            )
+        else:
+            prog = float(music_state.get("art_progress") or 0)
+            prog = max(0.0, min(1.0, prog))
+            if prog > 0.001 or (playing and not paused):
+                c.create_arc(
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    start=90,
+                    extent=-360.0 * prog,
+                    outline=prog_c,
+                    width=MUSIC_RING_W,
+                    style=tk.ARC,
+                )
+
+        disc_r = max(24, min(cw, ch) // 2 - pad - MUSIC_RING_W - 8)
+        dsz = disc_r * 2
+        pil_base = music_state.get("art_pil_rgba")
+        if pil_base is not None:
+            try:
+                from PIL import ImageTk
+
+                rim = _pil_circle_rotated_disc(pil_base, float(music_state.get("art_angle") or 0), dsz)
+                pho = ImageTk.PhotoImage(rim)
+                music_state["art_photo"] = pho
+                c.create_image(cx, cy, image=pho)
+            except Exception:
+                c.create_text(
+                    cx,
+                    cy,
+                    text=str(music_state.get("art_placeholder") or ""),
+                    fill=UI_FG,
+                    width=max(80, dsz),
+                    justify="center",
+                )
+        else:
+            msg = str(music_state.get("art_placeholder") or "在左侧选择歌曲")
+            c.create_text(cx, cy, text=msg, fill=UI_FG, width=max(80, dsz), justify="center")
+
+    def _music_art_tick() -> None:
+        music_state["art_rotate_after"] = None
+        _music_art_draw_frame()
+        if bool(music_state.get("art_playing")) and not bool(music_state.get("playback_paused")):
+            music_state["art_rotate_after"] = root.after(45, _music_art_tick)
+
+    def _music_art_start_animation() -> None:
+        _music_art_cancel_tick()
+        music_state["art_playing"] = True
+        _music_art_tick()
+
+    def _music_art_stop_animation(*, reset_progress: bool = True) -> None:
+        music_state["art_playing"] = False
+        music_state["playback_paused"] = False
+        _music_art_cancel_tick()
+        if reset_progress:
+            music_state["art_progress"] = 0.0
+            music_state["art_indet_phase"] = 0.0
+        _music_art_draw_frame()
+
+    def _music_set_art_progress(p: float) -> None:
+        music_state["art_progress"] = max(0.0, min(1.0, float(p)))
+
+    def _music_on_playback_ended(play_gen: int) -> None:
+        if int(music_state.get("play_generation") or 0) != int(play_gen):
+            return
+        music_state["art_playing"] = False
+        music_state["playback_paused"] = False
+        music_state["art_progress"] = 0.0
+        music_state["art_indeterminate"] = False
+        _music_art_cancel_tick()
+        _music_art_draw_frame()
+
+    def _mpv_ipc_command(sock_path: str, command: list[Any]) -> bool:
+        try:
+            payload = (json.dumps({"command": command}) + "\n").encode("utf-8")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.55)
+                s.connect(sock_path)
+                s.sendall(payload)
+                buf = b""
+                for _ in range(16):
+                    chunk = s.recv(8192)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\n" in buf:
+                        break
+                line = buf.split(b"\n", 1)[0].decode("utf-8", "ignore").strip()
+                if not line:
+                    return False
+                out = json.loads(line)
+                return str(out.get("error") or "") == "success"
+        except Exception:
+            return False
+
+    def _mpv_ipc_get_prop(sock_path: str, name: str) -> Any:
+        try:
+            payload = (json.dumps({"command": ["get_property", name]}) + "\n").encode("utf-8")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.55)
+                s.connect(sock_path)
+                s.sendall(payload)
+                buf = b""
+                for _ in range(32):
+                    chunk = s.recv(8192)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b"\n" in buf:
+                        break
+                line = buf.split(b"\n", 1)[0].decode("utf-8", "ignore").strip()
+                if not line:
+                    return None
+                out = json.loads(line)
+                if str(out.get("error") or "") != "success":
+                    return None
+                return out.get("data")
+        except Exception:
+            return None
+
+    def _start_mpv_progress_poll(sock_path: str, proc: Any, play_gen: int) -> None:
+        stop_evt = threading.Event()
+        music_state["mpv_poll_stop"] = stop_evt
+
+        def run() -> None:
+            while not stop_evt.is_set():
+                try:
+                    if proc.poll() is not None:
+                        break
+                    if bool(music_state.get("playback_paused")):
+                        time.sleep(0.35)
+                        continue
+                    pos = _mpv_ipc_get_prop(sock_path, "time-pos")
+                    dur = _mpv_ipc_get_prop(sock_path, "duration")
+                    if isinstance(pos, (int, float)) and isinstance(dur, (int, float)) and float(dur) > 0.01:
+                        p = float(pos) / float(dur)
+
+                        def _apply(pp: float = p, _pg: int = play_gen) -> None:
+                            if int(music_state.get("play_generation") or 0) != _pg:
+                                return
+                            _music_set_art_progress(pp)
+
+                        root.after(0, _apply)
+                except Exception:
+                    pass
+                time.sleep(0.35)
+            if not stop_evt.is_set():
+                try:
+                    root.after(0, lambda pg=play_gen: _music_on_playback_ended(pg))
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _music_art_load_png_path(png_path: Path, *, sel_tok: int) -> None:
+        if int(music_state.get("sel_token") or 0) != int(sel_tok):
+            return
+        try:
+            from PIL import Image
+
+            im = Image.open(str(png_path)).convert("RGBA")
+            side = min(im.size)
+            left = (im.size[0] - side) // 2
+            top = (im.size[1] - side) // 2
+            im = im.crop((left, top, left + side, top + side))
+            music_state["art_pil_rgba"] = im
+            music_state["art_placeholder"] = ""
+        except Exception:
+            music_state["art_pil_rgba"] = None
+            music_state["art_placeholder"] = "封面解码失败"
+        _music_art_draw_frame()
+
+    def _music_toggle_pause_by_cover_click(_e: Any = None) -> None:
+        proc = music_state.get("audio_proc")
+        if proc is None:
+            set_status("请先播放一首歌曲，再点击封面暂停/继续。")
+            return
+        try:
+            if proc.poll() is not None:
+                set_status("播放已结束。")
+                return
+        except Exception:
+            pass
+
+        sock = music_state.get("mpv_ipc_sock")
+        if sock and os.path.exists(str(sock)):
+            if not _mpv_ipc_command(str(sock), ["cycle", "pause"]):
+                set_status("暂停/继续指令发送失败")
+                return
+            pv = _mpv_ipc_get_prop(str(sock), "pause")
+            if isinstance(pv, bool):
+                music_state["playback_paused"] = pv
+            elif isinstance(pv, str):
+                music_state["playback_paused"] = pv.strip().lower() in ("yes", "true", "1")
+            else:
+                music_state["playback_paused"] = not bool(music_state.get("playback_paused"))
+            if music_state["playback_paused"]:
+                _music_art_cancel_tick()
+                _music_art_draw_frame()
+                set_status("已暂停（点击封面继续）")
+            else:
+                if music_state.get("art_playing"):
+                    _music_art_tick()
+                set_status("继续播放")
+            return
+
+        if sys.platform == "win32":
+            set_status("当前为 Windows 且无 mpv IPC，封面暂停不可用，请使用 mpv 播放。")
+            return
+
+        try:
+            pid = int(proc.pid)
+            if not bool(music_state.get("playback_paused")):
+                os.kill(pid, signal.SIGSTOP)
+                music_state["playback_paused"] = True
+                _music_art_cancel_tick()
+                _music_art_draw_frame()
+                set_status("已暂停（点击封面继续）")
+            else:
+                os.kill(pid, signal.SIGCONT)
+                music_state["playback_paused"] = False
+                if music_state.get("art_playing"):
+                    _music_art_tick()
+                set_status("继续播放")
+        except Exception as ex:  # noqa: BLE001
+            set_status(f"暂停失败：{ex}")
+
+    music_art_canvas.bind("<Button-1>", _music_toggle_pause_by_cover_click)
 
     tk.Label(
         music_player_holder,
@@ -2241,6 +2571,25 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     ).pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 12))
 
     def _stop_music_audio() -> None:
+        ev = music_state.get("mpv_poll_stop")
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+            music_state["mpv_poll_stop"] = None
+        sp = music_state.get("mpv_ipc_sock")
+        if sp:
+            try:
+                p = Path(str(sp))
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+            music_state["mpv_ipc_sock"] = None
         proc = music_state.get("audio_proc")
         if proc is not None:
             try:
@@ -2252,14 +2601,26 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
             except Exception:
                 pass
             music_state["audio_proc"] = None
+        music_state["art_indeterminate"] = False
+        music_state["playback_paused"] = False
+        _music_art_stop_animation(reset_progress=True)
 
-    def _load_music_cover_async(*, item: MusicItem, label: Any, w: int, h: int, cache_key: str) -> None:
+    def _load_music_cover_async(*, item: MusicItem, w: int, h: int, cache_key: str) -> None:
         sel_tok = int(music_state.get("sel_token") or 0)
 
         def worker() -> None:
             try:
                 pic_url = item.pic_url
                 if not pic_url:
+
+                    def _no_pic() -> None:
+                        if int(music_state.get("sel_token") or 0) != sel_tok:
+                            return
+                        music_state["art_pil_rgba"] = None
+                        music_state["art_placeholder"] = "暂无封面"
+                        _music_art_draw_frame()
+
+                    root.after(0, _no_pic)
                     return
                 tmp_dir = Path(tempfile.gettempdir()) / "nothing_music_covers"
                 tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -2295,19 +2656,20 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                         return
                     if not png_path.exists():
                         return
-                    photo = tk.PhotoImage(file=str(png_path))
-                    label.configure(image=photo, text="")
-                    label.image = photo
-                    music_cover_cache[cache_key] = photo
+                    try:
+                        photo = tk.PhotoImage(file=str(png_path))
+                        music_cover_cache[cache_key] = photo
+                    except Exception:
+                        pass
+                    _music_art_load_png_path(png_path, sel_tok=sel_tok)
 
                 root.after(0, _apply)
             except Exception:
                 return
 
-        try:
-            label.configure(text="加载封面中...", image="")
-        except Exception:
-            pass
+        music_state["art_placeholder"] = "加载封面中…"
+        music_state["art_pil_rgba"] = None
+        _music_art_draw_frame()
         threading.Thread(target=worker, daemon=True).start()
 
     def _play_music_selected() -> None:
@@ -2341,7 +2703,24 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                 mpv_path = shutil.which("mpv")
                 ffplay_path = shutil.which("ffplay")
                 cmd: list[str] | None = None
-                if mpv_path:
+                ipc_sock: str | None = None
+                use_ipc = False
+                if mpv_path and sys.platform != "win32":
+                    ipc_sock = str(Path(tempfile.gettempdir()) / f"nothing_mpv_{uuid.uuid4().hex[:12]}.sock")
+                    try:
+                        if os.path.exists(ipc_sock):
+                            os.unlink(ipc_sock)
+                    except Exception:
+                        pass
+                    cmd = [
+                        mpv_path,
+                        "--no-video",
+                        "--no-terminal",
+                        f"--input-ipc-server={ipc_sock}",
+                        play_url,
+                    ]
+                    use_ipc = True
+                elif mpv_path:
                     cmd = [mpv_path, "--no-video", "--no-terminal", play_url]
                 elif ffplay_path:
                     cmd = [ffplay_path, "-nodisp", "-autoexit", "-loglevel", "quiet", play_url]
@@ -2353,6 +2732,15 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                         pass
                     return
                 try:
+                    music_state["art_progress"] = 0.0
+                    music_state["art_indeterminate"] = (ffplay_path and not mpv_path) or (
+                        bool(mpv_path) and sys.platform == "win32"
+                    )
+                    if use_ipc and ipc_sock:
+                        music_state["art_indeterminate"] = False
+                        music_state["mpv_ipc_sock"] = ipc_sock
+                    else:
+                        music_state["mpv_ipc_sock"] = None
                     proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.DEVNULL,
@@ -2360,8 +2748,16 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                     )
                     music_state["audio_proc"] = proc
                     set_status(f"正在播放：{ttl}")
+                    _music_art_start_animation()
+                    if use_ipc and ipc_sock:
+                        _start_mpv_progress_poll(ipc_sock, proc, play_gen)
                 except Exception as e:  # noqa: BLE001
                     set_status(f"启动播放器失败：{e}")
+                    if ipc_sock:
+                        try:
+                            Path(ipc_sock).unlink()
+                        except OSError:
+                            pass
 
             root.after(0, _apply)
 
@@ -2377,7 +2773,6 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         music_artist_var.set(f"{art}" + (f" · {alb}" if alb else ""))
         _load_music_cover_async(
             item=item,
-            label=music_cover_label,
             w=MUSIC_PANEL_W,
             h=MUSIC_PANEL_H,
             cache_key=f"m_{item.song_id}_{MUSIC_PANEL_W}x{MUSIC_PANEL_H}",
@@ -2658,6 +3053,8 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     except Exception:
         pass
     music_play_btn.pack(side=tk.TOP, padx=10, pady=(0, 14))
+
+    _music_art_draw_frame()
 
     _on_music_hot_clicked()
 
@@ -3542,6 +3939,10 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     # 初始化
     set_root_alpha(1.0)
     _apply_theme_to_all(str(app_state.get("theme_mode") or "night"))
+    try:
+        _music_art_draw_frame()
+    except Exception:
+        pass
     _render_theme_switch()
     # apply_read_bg(read_alpha.get())
     # apply_read_font()
