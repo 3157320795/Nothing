@@ -443,6 +443,10 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         nxt = "day" if cur == "night" else "night"
         app_state["theme_mode"] = nxt
         _apply_theme_to_all(nxt)
+        try:
+            _redraw_fund_history_if_loaded()
+        except Exception:
+            pass
         _render_theme_switch()
         try:
             set_status("已切换主题：" + ("白天" if nxt == "day" else "黑夜"))
@@ -940,6 +944,128 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         _fund_save_items_to_disk()
         set_status("已清空基金列表")
 
+    def _render_fund_history_chart(*, _fundcode: str, _points: list[tuple[str, float, float]], keep_status: bool = False) -> None:
+        # 将图表绘制到基金页下方 Canvas 中，并根据当前主题选择高对比度配色。
+        fund_history_holder["code"] = _fundcode
+        fund_history_holder["points"] = list(_points)
+        try:
+            fund_history_canvas.delete("all")
+        except Exception:
+            pass
+
+        if not keep_status:
+            fund_history_status_var.set("已加载，点击图中点位查看详细数据")
+
+        try:
+            fund_history_canvas.update_idletasks()
+        except Exception:
+            pass
+
+        canvas = fund_history_canvas
+        points = list(_points)
+        cw = max(300, canvas.winfo_width())
+        ch = max(200, canvas.winfo_height())
+        left, top, right, bottom = 70, 20, cw - 60, ch - 60
+        pw = max(1, right - left)
+        ph = max(1, bottom - top)
+
+        is_day = str(app_state.get("theme_mode") or "night").lower() == "day"
+        axis = "#8A8A8A" if is_day else "#666666"
+        grid = "#E3E3E3" if is_day else "#2A2A2A"
+        nav_line = "#1F6FEB" if is_day else "#7AB8FF"
+        point_fill = "#1458C9" if is_day else "#A8D4FF"
+        point_outline = nav_line
+
+        canvas.create_line(left, top, left, bottom, fill=axis)
+        canvas.create_line(left, bottom, right, bottom, fill=axis)
+
+        xs = [p[0] for p in points]
+        ys_nav = [p[1] for p in points]
+        n = len(points)
+
+        min_nav, max_nav = min(ys_nav), max(ys_nav)
+        if max_nav == min_nav:
+            max_nav += 1e-6
+
+        def x_at(i: int) -> float:
+            if n <= 1:
+                return left
+            return left + (pw * i / (n - 1))
+
+        def y_nav(v: float) -> float:
+            return bottom - (v - min_nav) / (max_nav - min_nav) * ph
+
+        for k in range(5):
+            yy = top + ph * k / 4
+            canvas.create_line(left, yy, right, yy, fill=grid)
+
+        nav_pts: list[float] = []
+        for i, (_, nav, _pct) in enumerate(points):
+            nav_pts.extend([x_at(i), y_nav(nav)])
+        nav_line_id = canvas.create_line(*nav_pts, fill=nav_line, width=2, smooth=True, tags=("navline",))
+
+        def _click_from_line(_e: Any) -> None:
+            try:
+                x = float(getattr(_e, "x", left))
+            except Exception:
+                x = left
+            if pw <= 0 or n <= 1:
+                idx = 0
+            else:
+                rel = (x - left) / pw
+                idx = int(round(rel * (n - 1)))
+            idx = max(0, min(n - 1, idx))
+            _d, _nav, _pct = points[idx]
+            fund_history_status_var.set(f"{_d}  净值={_nav:.4f}  涨跌幅={_pct:.2f}%")
+
+        canvas.tag_bind(nav_line_id, "<Button-1>", _click_from_line)
+
+        canvas.create_text(left - 8, top, text=f"{max_nav:.4f}", fill=UI_FG, anchor="e")
+        canvas.create_text(left - 8, bottom, text=f"{min_nav:.4f}", fill=UI_FG, anchor="e")
+
+        tick_count = 6
+        for k in range(tick_count):
+            i = int((n - 1) * k / (tick_count - 1))
+            x = x_at(i)
+            d = xs[i]
+            canvas.create_line(x, bottom, x, bottom + 4, fill=axis)
+            anchor = "n"
+            if k == 0:
+                anchor = "nw"
+            elif k == tick_count - 1:
+                anchor = "ne"
+            canvas.create_text(x, bottom + 14, text=d[5:], fill=UI_FG, anchor=anchor)
+
+        for i, (d, nav, pct) in enumerate(points):
+            x = x_at(i)
+            y = y_nav(nav)
+            tag = f"pt_{i}"
+            r = 3.2
+            canvas.create_oval(
+                x - r,
+                y - r,
+                x + r,
+                y + r,
+                fill=point_fill,
+                outline=point_outline,
+                tags=(tag,),
+            )
+
+            def _click(_e: Any = None, *, _i: int = i) -> None:
+                _d, _nav, _pct = points[_i]
+                fund_history_status_var.set(f"{_d}  净值={_nav:.4f}  涨跌幅={_pct:.2f}%")
+
+            canvas.tag_bind(tag, "<Button-1>", _click)
+
+        set_status(f"历史净值已展示: {_fundcode}")
+
+    def _redraw_fund_history_if_loaded() -> None:
+        points = list(fund_history_holder.get("points") or [])
+        code = str(fund_history_holder.get("code") or "").strip()
+        if len(points) < 2 or not code:
+            return
+        _render_fund_history_chart(_fundcode=code, _points=points, keep_status=True)
+
     def fund_show_history_chart() -> None:
         sel = fund_tree.selection()
         if not sel:
@@ -985,112 +1111,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                     raise BiqugeError("可绘制点不足")
 
                 def _render_into_fund_tab() -> None:
-                    # 将图表绘制到基金页下方 Canvas 中
-                    fund_history_holder["code"] = fundcode
-                    fund_history_holder["points"] = points
-                    try:
-                        fund_history_canvas.delete("all")
-                    except Exception:
-                        pass
-
-                    fund_history_status_var.set("已加载，点击图中点位查看详细数据")
-
-                    # 强制刷新一次布局，避免 canvas 尺寸为 1/0
-                    try:
-                        fund_history_canvas.update_idletasks()
-                    except Exception:
-                        pass
-
-                    canvas = fund_history_canvas
-                    cw = max(300, canvas.winfo_width())
-                    ch = max(200, canvas.winfo_height())
-                    # 预留右侧文字空间，避免溢出
-                    left, top, right, bottom = 70, 20, cw - 60, ch - 60
-                    pw = max(1, right - left)
-                    ph = max(1, bottom - top)
-
-                    axis = "#666666"
-                    canvas.create_line(left, top, left, bottom, fill=axis)
-                    canvas.create_line(left, bottom, right, bottom, fill=axis)
-
-                    xs = [p[0] for p in points]
-                    ys_nav = [p[1] for p in points]
-                    n = len(points)
-
-                    min_nav, max_nav = min(ys_nav), max(ys_nav)
-                    if max_nav == min_nav:
-                        max_nav += 1e-6
-
-                    def x_at(i: int) -> float:
-                        if n <= 1:
-                            return left
-                        return left + (pw * i / (n - 1))
-
-                    def y_nav(v: float) -> float:
-                        return bottom - (v - min_nav) / (max_nav - min_nav) * ph
-
-                    # 辅助刻度
-                    for k in range(5):
-                        yy = top + ph * k / 4
-                        canvas.create_line(left, yy, right, yy, fill="#2a2a2a")
-
-                    # 两条折线
-                    nav_pts: list[float] = []
-                    for i, (_, nav, _pct) in enumerate(points):
-                        nav_pts.extend([x_at(i), y_nav(nav)])
-                    nav_line_id = canvas.create_line(*nav_pts, fill="#ffffff", width=2, smooth=True, tags=("navline",))
-
-                    def _click_from_line(_e: Any) -> None:
-                        # 根据点击的 x 坐标推算最邻近点位索引
-                        try:
-                            x = float(getattr(_e, "x", left))
-                        except Exception:
-                            x = left
-                        if pw <= 0 or n <= 1:
-                            idx = 0
-                        else:
-                            rel = (x - left) / pw
-                            idx = int(round(rel * (n - 1)))
-                        idx = max(0, min(n - 1, idx))
-                        _d, _nav, _pct = points[idx]
-                        fund_history_status_var.set(f"{_d}  净值={_nav:.4f}  涨跌幅={_pct:.2f}%")
-
-                    canvas.tag_bind(nav_line_id, "<Button-1>", _click_from_line)
-
-                    # Y 轴标签
-                    canvas.create_text(left - 8, top, text=f"{max_nav:.4f}", fill="#ffffff", anchor="e")
-                    canvas.create_text(left - 8, bottom, text=f"{min_nav:.4f}", fill="#ffffff", anchor="e")
-
-                    # X 轴日期（抽样显示）
-                    tick_count = 6
-                    for k in range(tick_count):
-                        i = int((n - 1) * k / (tick_count - 1))
-                        x = x_at(i)
-                        d = xs[i]
-                        canvas.create_line(x, bottom, x, bottom + 4, fill=axis)
-                        # 边界刻度单独处理 anchor，避免文本右侧/左侧溢出
-                        anchor = "n"
-                        if k == 0:
-                            anchor = "nw"
-                        elif k == tick_count - 1:
-                            anchor = "ne"
-                        canvas.create_text(x, bottom + 14, text=d[5:], fill=UI_FG, anchor=anchor)
-
-                    # 点位标记（可点击）
-                    for i, (d, nav, pct) in enumerate(points):
-                        x = x_at(i)
-                        y = y_nav(nav)
-                        tag = f"pt_{i}"
-                        r = 3.2
-                        oid = canvas.create_oval(x - r, y - r, x + r, y + r, fill="#ffffff", outline="#ffffff", tags=(tag,))
-
-                        def _click(_e: Any = None, *, _i: int = i) -> None:
-                            _d, _nav, _pct = points[_i]
-                            fund_history_status_var.set(f"{_d}  净值={_nav:.4f}  涨跌幅={_pct:.2f}%")
-
-                        canvas.tag_bind(tag, "<Button-1>", _click)
-
-                    set_status(f"历史净值已展示: {fundcode}")
+                    _render_fund_history_chart(_fundcode=fundcode, _points=points)
 
                 root.after(0, _render_into_fund_tab)
             except Exception as e:  # noqa: BLE001
