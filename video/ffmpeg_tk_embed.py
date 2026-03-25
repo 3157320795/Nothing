@@ -5,7 +5,11 @@
 说明：
 - 需要 PATH 中可执行 `ffmpeg`。
 - 需要 `pillow`（PIL）用于 RGB → PhotoImage。
-- 当前仅输出画面（`-an` 静音）；音轨需另行扩展（如第二条管道或 ffplay）。
+- 同一 ffmpeg 进程双路输出：视频 → stdout rawvideo；音轨 → 系统音频设备（muxer 随平台/构建而定，
+  如 macOS 常见 audiotoolbox，Linux 常见 pulse/alsa，Windows 常见 wasapi）。无音轨或设备打开失败时
+  自动回退为仅画面。
+- 帧队列满时丢弃最旧帧并立刻 put 新帧：若用阻塞 put 背压 ffmpeg，单进程里会同时卡住音轨输出，
+  表现为播一段时间后声音消失。
 """
 
 from __future__ import annotations
@@ -13,8 +17,10 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import sys
 import threading
-from queue import Empty, Queue
+import time
+from queue import Empty, Full, Queue
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -64,6 +70,198 @@ def _probe_video_fps(*, url: str, headers: str, timeout: float = 25.0) -> float:
         return 30.0
 
 
+_OUTPUT_MUXERS: Optional[set[str]] = None
+
+
+def _parse_output_muxer_names(text: str) -> set[str]:
+    """解析 `ffmpeg -muxers` 输出中带 muxing(E) 的格式名。"""
+    names: set[str] = set()
+    for line in text.splitlines():
+        if not line.startswith(" ") or "---" in line[:20]:
+            continue
+        if "D.. = " in line or line.strip() == "Formats:":
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        flags, name = parts[0], parts[1]
+        if "E" in flags:
+            names.add(name)
+    return names
+
+
+def _get_output_muxers(*, ffmpeg: str) -> set[str]:
+    global _OUTPUT_MUXERS
+    if _OUTPUT_MUXERS is not None:
+        return _OUTPUT_MUXERS
+    try:
+        p = subprocess.run(
+            [ffmpeg, "-hide_banner", "-muxers"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        blob = (p.stdout or "") + (p.stderr or "")
+        _OUTPUT_MUXERS = _parse_output_muxer_names(blob)
+    except Exception as e:
+        logger.debug("枚举 ffmpeg muxer 失败: %s", e)
+        _OUTPUT_MUXERS = set()
+    return _OUTPUT_MUXERS
+
+
+def _pick_audio_sink(*, ffmpeg: str) -> Optional[tuple[str, str]]:
+    """
+    返回 (format_name, output_arg) 供第二路输出使用，例如 ("audiotoolbox", "default")。
+    若当前 ffmpeg/平台无可用的音频输出 muxer，返回 None。
+    """
+    muxers = _get_output_muxers(ffmpeg=ffmpeg)
+    plat = sys.platform
+    candidates: list[tuple[str, str]] = []
+    if plat == "darwin":
+        for fmt in ("audiotoolbox", "coreaudio"):
+            if fmt in muxers:
+                candidates.append((fmt, "default"))
+    elif plat == "win32":
+        if "wasapi" in muxers:
+            candidates.append(("wasapi", "default"))
+    elif plat.startswith("linux"):
+        for fmt in ("pulse", "alsa"):
+            if fmt in muxers:
+                candidates.append((fmt, "default"))
+    return candidates[0] if candidates else None
+
+
+def _probe_has_audio(*, url: str, headers: str, timeout: float = 25.0) -> bool:
+    """ffprobe 检测是否存在可解码音轨。"""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return False
+    try:
+        p = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-headers",
+                headers,
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return any(ch.isdigit() for ch in (p.stdout or ""))
+    except Exception as e:
+        logger.debug("ffprobe 音频检测失败，按无音轨处理: %s", e)
+        return False
+
+
+def _build_ffmpeg_cmd(
+    *,
+    ffmpeg: str,
+    hdr: str,
+    url: str,
+    vf: str,
+    with_audio_sink: Optional[tuple[str, str]],
+) -> list[str]:
+    """构造 ffmpeg 参数列表：一路 rawvideo → pipe:1，可选第二路系统音频。"""
+    base = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-rw_timeout",
+        "15000000",
+        "-headers",
+        hdr,
+        "-i",
+        url,
+        "-map",
+        "0:v:0",
+        "-fflags",
+        "+genpts",
+        "-vf",
+        vf,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    if with_audio_sink is not None:
+        fmt, out = with_audio_sink
+        base.extend(
+            [
+                "-map",
+                "0:a:0",
+                "-f",
+                fmt,
+                out,
+            ]
+        )
+    return base
+
+
+def _popen_ffmpeg(cmd: list[str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        bufsize=0,
+    )
+
+
+def _try_launch_ffmpeg(
+    *,
+    cmd_with_audio: Optional[list[str]],
+    cmd_video_only: list[str],
+) -> tuple[subprocess.Popen[bytes], bool]:
+    """
+    优先启动带音频的命令；若进程立刻退出则再试仅视频。
+    返回 (proc, audio_active)。
+    """
+    attempts: list[tuple[list[str], bool]] = []
+    if cmd_with_audio is not None:
+        attempts.append((cmd_with_audio, True))
+    attempts.append((cmd_video_only, False))
+
+    last_exc: Optional[BaseException] = None
+    for cmd, audio_on in attempts:
+        try:
+            proc = _popen_ffmpeg(cmd)
+        except Exception as e:
+            last_exc = e
+            continue
+        time.sleep(0.2)
+        if proc.poll() is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+            continue
+        return proc, audio_on
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("ffmpeg 未能保持运行")
+
+
 class FfmpegTkEmbedPlayer:
     """在 Tk Canvas 上播放网络视频（ffmpeg rawvideo → PIL → PhotoImage）。"""
 
@@ -91,6 +289,7 @@ class FfmpegTkEmbedPlayer:
         self._width = 0
         self._height = 0
         self._ended = False
+        self._playing_with_audio = False
 
     def stop(self) -> None:
         """用户停止或切换视频时调用：不触发 on_stopped（由外层恢复 UI）。"""
@@ -168,40 +367,23 @@ class FfmpegTkEmbedPlayer:
         # 按源视频帧率刷新 UI；原先用固定 16ms 会远快于 24/25fps 片源，且队列丢帧 = 快进感
         self._interval_ms = max(8, min(80, int(round(1000.0 / fps))))
 
-        cmd = [
-            ffmpeg,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            # HTTP 长时间无数据时避免无限挂死（微秒）
-            "-rw_timeout",
-            "15000000",
-            "-headers",
-            hdr,
-            "-i",
-            url,
-            "-an",
-            "-fflags",
-            "+genpts",
-            "-vf",
-            vf,
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ]
+        sink = _pick_audio_sink(ffmpeg=ffmpeg)
+        has_audio_stream = _probe_has_audio(url=url, headers=hdr)
+        cmd_video_only = _build_ffmpeg_cmd(
+            ffmpeg=ffmpeg, hdr=hdr, url=url, vf=vf, with_audio_sink=None
+        )
+        cmd_with_audio: Optional[list[str]] = None
+        if has_audio_stream and sink is not None:
+            cmd_with_audio = _build_ffmpeg_cmd(
+                ffmpeg=ffmpeg, hdr=hdr, url=url, vf=vf, with_audio_sink=sink
+            )
 
         try:
             # 必须丢弃 stderr 或单独线程持续读取：若 PIPE 且不读，缓冲区满后 ffmpeg
             # 会阻塞，stdout 永远不出帧 → Canvas 一直黑屏。
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                bufsize=0,
+            self._proc, self._playing_with_audio = _try_launch_ffmpeg(
+                cmd_with_audio=cmd_with_audio,
+                cmd_video_only=cmd_video_only,
             )
         except Exception as e:
             self.set_status(f"启动 ffmpeg 失败：{e}")
@@ -222,11 +404,23 @@ class FfmpegTkEmbedPlayer:
                 buf += chunk
             return bytes(buf)
 
+        def _enqueue_frame_drop_oldest(raw: bytes) -> None:
+            """
+            队列满时丢最旧帧再入队。若用阻塞 put 背压读线程，ffmpeg 无法继续写 pipe:1，
+            单进程双输出时整路解码停滞，音轨也无法送入设备，缓冲耗尽后声音会消失。
+            """
+            while True:
+                try:
+                    self._queue.put_nowait(raw)
+                    return
+                except Full:
+                    try:
+                        self._queue.get_nowait()
+                    except Empty:
+                        pass
+
         def _read_loop() -> None:
-            """
-            阻塞 put：队列满时解码线程会等待主线程取走帧，从而把解码速度限制在「显示速度」附近，
-            避免全速解码 + 丢帧导致「比原片快、缺帧」。
-            """
+            """尽快从 stdout 读满帧并入队；显示侧按帧率取帧，跟不上时丢帧而非阻塞 ffmpeg。"""
             try:
                 while not self._stop.is_set() and self._proc and self._proc.stdout:
                     raw = _read_exact(self._proc.stdout, frame_size)
@@ -234,15 +428,16 @@ class FfmpegTkEmbedPlayer:
                         break
                     if self._stop.is_set():
                         break
-                    self._queue.put(raw)
+                    _enqueue_frame_drop_oldest(raw)
             finally:
                 pass
 
         self._reader = threading.Thread(target=_read_loop, daemon=True)
         self._reader.start()
 
+        _au = "有声" if self._playing_with_audio else "仅画面"
         self.set_status(
-            f"正在缓冲…（内嵌·ffmpeg，约 {fps:.1f}fps / {self._interval_ms}ms 每帧）"
+            f"正在缓冲…（内嵌·ffmpeg·{_au}，约 {fps:.1f}fps / {self._interval_ms}ms 每帧）"
         )
         # 闭包内引用 ImageTk，供 _tick 使用
         self._Image = Image
@@ -311,8 +506,9 @@ class FfmpegTkEmbedPlayer:
             )
             if not self._first_frame_ok:
                 self._first_frame_ok = True
+                _au = "有声" if self._playing_with_audio else "仅画面"
                 self.set_status(
-                    f"播放中（内嵌·ffmpeg·静音，约 {self._play_fps:.1f} fps）"
+                    f"播放中（内嵌·ffmpeg·{_au}，约 {self._play_fps:.1f} fps）"
                 )
         except Exception as e:
             logger.exception("ffmpeg 内嵌渲染一帧失败: %s", e)
