@@ -370,6 +370,15 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
     # 退出按钮（无系统边框时需要自己提供）
     def _close_app() -> None:
+        # 先停掉外部播放器子进程（mpv/ffplay/ffmpeg），再销毁 GUI。
+        try:
+            _stop_embedded_video(restore_cover=False)
+        except Exception:
+            pass
+        try:
+            _stop_music_audio()
+        except Exception:
+            pass
         try:
             root.destroy()
         except Exception:
