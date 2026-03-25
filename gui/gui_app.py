@@ -36,6 +36,7 @@ from saved.saver import save_chapter_to_disk
 from video.video import VideoItem, bilibili_hot_videos_fetch, bilibili_search_videos
 from video.bilibili_direct import parse_bilibili_minimal, UA
 from video.ffmpeg_tk_embed import FfmpegTkEmbedPlayer
+from song.music import MusicItem, music_hot_fetch, music_search_songs, netease_song_play_url, netease_song_page_url
 
 
 def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, theme: str = "night") -> int:
@@ -638,10 +639,12 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     reader_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     fund_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     video_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
+    music_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     notebook.add(home, text="首页")
     notebook.add(reader_tab, text="阅读")
     notebook.add(fund_tab, text="基金")
     notebook.add(video_tab, text="视频")
+    notebook.add(music_tab, text="音乐")
 
     # ------------------------------------------------------------------
     # 基金：输入基金代码 + 持有份额，点击“新增”获取净值信息
@@ -2065,6 +2068,568 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
     # 初始化：默认加载热门
     _on_hot_clicked()
+
+    # ------------------------------------------------------------------
+    # 音乐：网易云热歌榜 / 搜索 + 左侧列表 + 右侧试听区（mpv/ffplay）
+    # ------------------------------------------------------------------
+    music_state: dict[str, Any] = {
+        "token": 0,
+        "play_generation": 0,
+        "mode": "hot",
+        "page": 1,
+        "page_size": 20,
+        "keyword": "",
+        "loading_more": False,
+        "has_more": True,
+        "songs": [],
+        "audio_proc": None,
+        "selected_id": 0,
+        "auto_loading_queued": False,
+        "sel_token": 0,
+    }
+    music_cover_cache: dict[str, Any] = {}
+
+    MUSIC_THUMB_W, MUSIC_THUMB_H = 64, 64
+    MUSIC_PANEL_W, MUSIC_PANEL_H = 360, 360
+
+    music_top = tk.Frame(music_tab, bg=UI_BG, bd=0, highlightthickness=0)
+    music_top.pack(side=tk.TOP, fill=tk.X, padx=12, pady=12)
+
+    music_keyword_var = tk.StringVar(value="")
+    music_search_label = tk.Label(music_top, text="音乐搜索:", bg=UI_BG, fg=UI_FG)
+    music_keyword_entry = tk.Entry(
+        music_top,
+        width=18,
+        bg=UI_BG,
+        fg=UI_FG,
+        insertbackground=UI_FG,
+        bd=0,
+        highlightthickness=0,
+        textvariable=music_keyword_var,
+    )
+
+    music_main = tk.PanedWindow(music_tab, orient=tk.HORIZONTAL, sashrelief=tk.FLAT, bg=UI_BG, bd=0)
+    music_main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+    music_list_holder = tk.Frame(music_main, bg=UI_BG, bd=0, highlightthickness=0)
+    music_main.add(music_list_holder, minsize=400)
+    music_player_holder = tk.Frame(music_main, bg=UI_BG, bd=0, highlightthickness=0)
+    music_main.add(music_player_holder, minsize=420)
+
+    music_canvas = tk.Canvas(music_list_holder, bg=UI_BG, bd=0, highlightthickness=0)
+    music_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    music_list_frame = tk.Frame(music_canvas, bg=UI_BG, bd=0, highlightthickness=0)
+    music_window_id = music_canvas.create_window((0, 0), window=music_list_frame, anchor="nw")
+
+    def _refresh_music_scrollregion() -> None:
+        try:
+            bbox = music_canvas.bbox("all")
+            if bbox:
+                music_canvas.configure(scrollregion=bbox)
+        except Exception:
+            pass
+
+    music_canvas.bind(
+        "<Configure>",
+        lambda e: (
+            music_canvas.itemconfigure(music_window_id, width=max(1, int(getattr(e, "width", 1)))),
+            _refresh_music_scrollregion(),
+        ),
+    )
+    music_list_frame.bind("<Configure>", lambda _e=None: _refresh_music_scrollregion())
+
+    def _music_wheel(event: Any) -> str:
+        try:
+            step = -1 if event.delta > 0 else 1
+        except Exception:
+            step = 0
+        if step != 0:
+            music_canvas.yview_scroll(step, "units")
+            if step > 0:
+                root.after(0, _try_auto_load_more_music)
+        return "break"
+
+    def _music_btn4(_e: Any) -> str:
+        music_canvas.yview_scroll(-1, "units")
+        return "break"
+
+    def _music_btn5(_e: Any) -> str:
+        music_canvas.yview_scroll(1, "units")
+        root.after(0, _try_auto_load_more_music)
+        return "break"
+
+    music_list_frame.bind("<MouseWheel>", _music_wheel)
+    music_list_frame.bind("<Button-4>", _music_btn4)
+    music_list_frame.bind("<Button-5>", _music_btn5)
+    music_canvas.bind("<MouseWheel>", _music_wheel)
+    music_canvas.bind("<Button-4>", _music_btn4)
+    music_canvas.bind("<Button-5>", _music_btn5)
+
+    def _clear_music_list() -> None:
+        for child in music_list_frame.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
+
+    music_title_var = tk.StringVar(value="")
+    music_artist_var = tk.StringVar(value="")
+
+    tk.Label(music_player_holder, text="音乐试听", bg=UI_BG, fg=UI_FG).pack(anchor="w", padx=10, pady=(6, 0))
+
+    music_cover_box = tk.Frame(music_player_holder, bg=UI_BG, width=MUSIC_PANEL_W, height=MUSIC_PANEL_H)
+    music_cover_box.pack_propagate(False)
+    music_cover_box.pack(side=tk.TOP, padx=10, pady=(8, 10))
+
+    music_cover_label = tk.Label(
+        music_cover_box,
+        bg=UI_BG,
+        fg=UI_FG,
+        text="在左侧选择歌曲",
+        anchor="center",
+        justify="center",
+        wraplength=MUSIC_PANEL_W - 20,
+    )
+    music_cover_label.pack(fill=tk.BOTH, expand=True)
+
+    tk.Label(
+        music_player_holder,
+        bg=UI_BG,
+        fg=UI_FG,
+        textvariable=music_title_var,
+        font=tkfont.Font(size=15, weight="bold"),
+        wraplength=MUSIC_PANEL_W,
+        justify="center",
+    ).pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 4))
+    tk.Label(
+        music_player_holder,
+        bg=UI_BG,
+        fg=UI_FG,
+        textvariable=music_artist_var,
+        wraplength=MUSIC_PANEL_W,
+        justify="center",
+    ).pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 12))
+
+    def _stop_music_audio() -> None:
+        proc = music_state.get("audio_proc")
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            music_state["audio_proc"] = None
+
+    def _load_music_cover_async(*, item: MusicItem, label: Any, w: int, h: int, cache_key: str) -> None:
+        sel_tok = int(music_state.get("sel_token") or 0)
+
+        def worker() -> None:
+            try:
+                pic_url = item.pic_url
+                if not pic_url:
+                    return
+                tmp_dir = Path(tempfile.gettempdir()) / "nothing_music_covers"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                jpg_path = tmp_dir / f"m_{item.song_id}.jpg"
+                png_path = tmp_dir / f"m_{item.song_id}_{w}x{h}.png"
+                if not png_path.exists():
+                    img_bytes = http_get(
+                        pic_url,
+                        timeout=20,
+                        headers={"Accept": "image/*", "Referer": "https://music.163.com/"},
+                    )
+                    jpg_path.write_bytes(img_bytes)
+                    subprocess.run(
+                        [
+                            "sips",
+                            "-s",
+                            "format",
+                            "png",
+                            "-z",
+                            str(h),
+                            str(w),
+                            str(jpg_path),
+                            "--out",
+                            str(png_path),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True,
+                    )
+
+                def _apply() -> None:
+                    if int(music_state.get("sel_token") or 0) != sel_tok:
+                        return
+                    if not png_path.exists():
+                        return
+                    photo = tk.PhotoImage(file=str(png_path))
+                    label.configure(image=photo, text="")
+                    label.image = photo
+                    music_cover_cache[cache_key] = photo
+
+                root.after(0, _apply)
+            except Exception:
+                return
+
+        try:
+            label.configure(text="加载封面中...", image="")
+        except Exception:
+            pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _play_music_selected() -> None:
+        sid = int(music_state.get("selected_id") or 0)
+        if sid <= 0:
+            set_status("请先在左侧选择一首歌曲。")
+            return
+        music_state["play_generation"] = int(music_state.get("play_generation") or 0) + 1
+        play_gen = int(music_state["play_generation"])
+        _stop_music_audio()
+        ttl = str(music_title_var.get() or "").strip() or "music"
+        set_status("正在解析播放地址…")
+
+        def worker() -> None:
+            try:
+                play_url = netease_song_play_url(sid)
+            except Exception as e:  # noqa: BLE001
+                root.after(0, lambda e=e: set_status(f"解析播放地址失败：{e}"))
+                return
+
+            def _apply() -> None:
+                if int(music_state.get("play_generation") or 0) != play_gen:
+                    return
+                if not play_url:
+                    set_status("无可用直链（版权限制），正在打开网页试听…")
+                    try:
+                        webbrowser.open(netease_song_page_url(sid))
+                    except Exception:
+                        pass
+                    return
+                mpv_path = shutil.which("mpv")
+                ffplay_path = shutil.which("ffplay")
+                cmd: list[str] | None = None
+                if mpv_path:
+                    cmd = [mpv_path, "--no-video", "--no-terminal", play_url]
+                elif ffplay_path:
+                    cmd = [ffplay_path, "-nodisp", "-autoexit", "-loglevel", "quiet", play_url]
+                if not cmd:
+                    set_status("未找到 mpv / ffplay，无法本地播放，改为打开网页")
+                    try:
+                        webbrowser.open(netease_song_page_url(sid))
+                    except Exception:
+                        pass
+                    return
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    music_state["audio_proc"] = proc
+                    set_status(f"正在播放：{ttl}")
+                except Exception as e:  # noqa: BLE001
+                    set_status(f"启动播放器失败：{e}")
+
+            root.after(0, _apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _select_music(item: MusicItem, *, autoplay: bool = True) -> None:
+        music_state["sel_token"] = int(music_state.get("sel_token") or 0) + 1
+        _stop_music_audio()
+        music_state["selected_id"] = int(item.song_id)
+        music_title_var.set(item.title)
+        art = str(item.artist or "").strip()
+        alb = str(item.album or "").strip()
+        music_artist_var.set(f"{art}" + (f" · {alb}" if alb else ""))
+        _load_music_cover_async(
+            item=item,
+            label=music_cover_label,
+            w=MUSIC_PANEL_W,
+            h=MUSIC_PANEL_H,
+            cache_key=f"m_{item.song_id}_{MUSIC_PANEL_W}x{MUSIC_PANEL_H}",
+        )
+        if autoplay:
+            _play_music_selected()
+
+    def _truncate_m(s: str, n: int = 22) -> str:
+        t = str(s or "").strip()
+        return t if len(t) <= n else t[: n - 1] + "…"
+
+    def _render_music_list(songs: list[MusicItem], *, append: bool = False) -> None:
+        if not append:
+            _stop_music_audio()
+            _clear_music_list()
+            music_state["songs"] = list(songs)
+        else:
+            music_state["songs"] = list(music_state.get("songs") or []) + list(songs)
+
+        if not songs and not append:
+            tk.Label(music_list_frame, text="暂无歌曲", bg=UI_BG, fg=UI_FG).pack(anchor="w", padx=6, pady=10)
+            return
+
+        tw, th = MUSIC_THUMB_W, MUSIC_THUMB_H
+        for item in songs:
+            card = tk.Frame(music_list_frame, bg=UI_BG, bd=0, highlightthickness=0)
+            card.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+
+            cover_box = tk.Frame(card, bg=UI_BG, width=tw, height=th)
+            cover_box.pack_propagate(False)
+            cover_box.pack(side=tk.LEFT, padx=(0, 8), pady=2)
+
+            cover_l = tk.Label(
+                cover_box,
+                bg=UI_BG,
+                fg=UI_FG,
+                text="…",
+                anchor="center",
+            )
+            cover_l.pack(fill=tk.BOTH, expand=True)
+
+            info = tk.Frame(card, bg=UI_BG, bd=0, highlightthickness=0)
+            info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+            line1 = f"{_truncate_m(item.title, 26)}"
+            line2 = f"{_truncate_m(item.artist, 20)}" + (f" · {_truncate_m(item.album, 14)}" if item.album else "")
+            tk.Label(
+                info,
+                bg=UI_BG,
+                fg=UI_FG,
+                text=line1,
+                anchor="w",
+            ).pack(anchor="w")
+            tk.Label(
+                info,
+                bg=UI_BG,
+                fg="#AAAAAA" if not is_day_theme else "#666666",
+                text=line2,
+                anchor="w",
+            ).pack(anchor="w")
+
+            _make_flat_button(card, "试听", lambda it=item: _select_music(it, autoplay=True)).pack(
+                side=tk.RIGHT, padx=4
+            )
+
+            def _on_click(_e: Any = None, *, _it: MusicItem = item) -> None:
+                _select_music(_it, autoplay=True)
+
+            for wdg in (card, cover_box, cover_l, info):
+                try:
+                    wdg.bind("<Button-1>", _on_click)
+                except Exception:
+                    pass
+
+            for wdg in (card, cover_box, cover_l, info):
+                try:
+                    wdg.bind("<MouseWheel>", _music_wheel)
+                    wdg.bind("<Button-4>", _music_btn4)
+                    wdg.bind("<Button-5>", _music_btn5)
+                except Exception:
+                    pass
+
+            tok = int(music_state.get("token") or 0)
+
+            def _cover_worker(*, _item: MusicItem = item, _label: Any = cover_l, _tok: int = tok) -> None:
+                try:
+                    if not _item.pic_url:
+                        return
+                    tmp_dir = Path(tempfile.gettempdir()) / "nothing_music_covers"
+                    tmp_dir.mkdir(parents=True, exist_ok=True)
+                    jpg_path = tmp_dir / f"m_{_item.song_id}.jpg"
+                    png_path = tmp_dir / f"m_{_item.song_id}_t{tw}x{th}.png"
+                    if not png_path.exists():
+                        img_bytes = http_get(
+                            _item.pic_url,
+                            timeout=20,
+                            headers={"Accept": "image/*", "Referer": "https://music.163.com/"},
+                        )
+                        jpg_path.write_bytes(img_bytes)
+                        subprocess.run(
+                            [
+                                "sips",
+                                "-s",
+                                "format",
+                                "png",
+                                "-z",
+                                str(th),
+                                str(tw),
+                                str(jpg_path),
+                                "--out",
+                                str(png_path),
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=True,
+                        )
+
+                    def _ap() -> None:
+                        if int(music_state.get("token") or 0) != _tok:
+                            return
+                        if not png_path.exists():
+                            return
+                        photo = tk.PhotoImage(file=str(png_path))
+                        _label.configure(image=photo, text="")
+                        _label.image = photo
+                        music_cover_cache[f"{_item.song_id}_t"] = photo
+
+                    root.after(0, _ap)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_cover_worker, daemon=True).start()
+
+        if songs and not append:
+            try:
+                _select_music(songs[0], autoplay=False)
+            except Exception:
+                pass
+
+        _refresh_music_scrollregion()
+
+    def _fetch_and_render_music(fetch_fn: Any, *, append: bool = False, **kwargs: Any) -> None:
+        music_state["token"] = int(music_state.get("token") or 0) + 1
+        token = int(music_state["token"])
+        set_status("音乐加载中…" if not append else "加载下一页…")
+
+        def worker() -> None:
+            try:
+                rows: list[MusicItem] = fetch_fn(**kwargs)
+
+                def _apply() -> None:
+                    if int(music_state.get("token") or 0) != token:
+                        return
+                    _render_music_list(rows, append=append)
+                    if append:
+                        music_state["loading_more"] = False
+                        music_state["auto_loading_queued"] = False
+                        ps = int(music_state.get("page_size") or 20)
+                        music_state["has_more"] = len(rows) >= ps
+                        set_status(
+                            f"第 {int(music_state.get('page') or 1)} 页：新增 {len(rows)} 首（共 {len(music_state.get('songs') or [])} 首）"
+                        )
+                    else:
+                        ps = int(music_state.get("page_size") or 20)
+                        music_state["has_more"] = len(rows) >= ps
+                        set_status(f"音乐加载完成（{len(rows)} 首）")
+
+                root.after(0, _apply)
+            except Exception as e:  # noqa: BLE001
+                if int(music_state.get("token") or 0) != token:
+                    return
+                err = str(e)
+
+                def _err() -> None:
+                    if append:
+                        music_state["loading_more"] = False
+                        music_state["auto_loading_queued"] = False
+                        music_state["page"] = max(1, int(music_state.get("page") or 1) - 1)
+                    set_status(f"音乐加载失败：{err}")
+
+                root.after(0, _err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _is_music_list_near_bottom() -> bool:
+        try:
+            _top, bottom = music_canvas.yview()
+        except Exception:
+            return False
+        return bottom >= 0.995
+
+    def _load_next_music_page() -> None:
+        if music_state.get("loading_more"):
+            return
+        if not music_state.get("has_more", True):
+            return
+        music_state["loading_more"] = True
+        music_state["page"] = int(music_state.get("page") or 1) + 1
+        page = int(music_state["page"])
+        ps = int(music_state.get("page_size") or 20)
+        mode = str(music_state.get("mode") or "hot")
+        if mode == "search":
+            kw = str(music_state.get("keyword") or "").strip()
+            if not kw:
+                music_state["loading_more"] = False
+                return
+            _fetch_and_render_music(
+                music_search_songs,
+                append=True,
+                keyword=kw,
+                page=page,
+                page_size=ps,
+            )
+        else:
+            _fetch_and_render_music(
+                music_hot_fetch,
+                append=True,
+                page=page,
+                page_size=ps,
+            )
+
+    def _try_auto_load_more_music() -> None:
+        if music_state.get("auto_loading_queued"):
+            return
+        if music_state.get("loading_more"):
+            return
+        if not _is_music_list_near_bottom():
+            return
+        music_state["auto_loading_queued"] = True
+        _load_next_music_page()
+
+    def _on_music_hot_clicked() -> None:
+        music_state["mode"] = "hot"
+        music_state["page"] = 1
+        music_state["keyword"] = ""
+        music_state["loading_more"] = False
+        music_state["auto_loading_queued"] = False
+        music_state["has_more"] = True
+        _fetch_and_render_music(music_hot_fetch, page=1, page_size=int(music_state.get("page_size") or 20))
+
+    def _on_music_search_clicked() -> None:
+        kw = (music_keyword_var.get() or "").strip()
+        if not kw:
+            set_status("请输入歌曲或歌手关键词。")
+            return
+        music_state["mode"] = "search"
+        music_state["page"] = 1
+        music_state["keyword"] = kw
+        music_state["loading_more"] = False
+        music_state["auto_loading_queued"] = False
+        music_state["has_more"] = True
+        _fetch_and_render_music(
+            music_search_songs,
+            keyword=kw,
+            page=1,
+            page_size=int(music_state.get("page_size") or 20),
+        )
+
+    music_hot_btn = _make_flat_button(music_top, "热门", _on_music_hot_clicked)
+    music_search_btn = _make_flat_button(music_top, "搜索", _on_music_search_clicked)
+    try:
+        music_search_label.pack_forget()
+        music_keyword_entry.pack_forget()
+    except Exception:
+        pass
+    music_hot_btn.pack(side=tk.LEFT, padx=6)
+    music_search_label.pack(side=tk.LEFT)
+    music_keyword_entry.pack(side=tk.LEFT, padx=(8, 12))
+    music_search_btn.pack(side=tk.LEFT, padx=6)
+    try:
+        music_keyword_entry.bind("<Return>", lambda _e: _on_music_search_clicked())
+    except Exception:
+        pass
+
+    music_play_btn = _make_flat_button(music_player_holder, "播放", _play_music_selected)
+    try:
+        music_play_btn.configure(font=tkfont.Font(size=14, weight="bold"))
+    except Exception:
+        pass
+    music_play_btn.pack(side=tk.TOP, padx=10, pady=(0, 14))
+
+    _on_music_hot_clicked()
 
     # ------------------------------------------------------------------
     # 首页：搜索 + 选书后自动全量爬取（从 chapterid=1 递增直到失败）
