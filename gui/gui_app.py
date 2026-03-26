@@ -40,6 +40,15 @@ from video.video import VideoItem, bilibili_hot_videos_fetch, bilibili_search_vi
 from video.bilibili_direct import parse_bilibili_minimal, UA
 from video.ffmpeg_tk_embed import FfmpegTkEmbedPlayer
 from song.music import MusicItem, music_hot_fetch, music_search_songs, netease_song_play_url, netease_song_page_url
+from cartoon.api import (
+    TencentComicItem,
+    analyze_cartoon_source,
+    source_chapter_image_urls,
+    source_comic_detail,
+    source_cover_headers,
+    source_hot_comics,
+    source_search_comics,
+)
 
 
 def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, theme: str = "night") -> int:
@@ -660,11 +669,13 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     fund_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     video_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     music_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     notebook.add(home, text="首页")
     notebook.add(reader_tab, text="阅读")
     notebook.add(fund_tab, text="基金")
     notebook.add(video_tab, text="视频")
     notebook.add(music_tab, text="音乐")
+    notebook.add(cartoon_tab, text="漫画")
 
     # ------------------------------------------------------------------
     # 基金：输入基金代码 + 持有份额，点击“新增”获取净值信息
@@ -1136,6 +1147,506 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
         # 真正启动后台拉取线程
         threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 漫画（腾讯动漫 ac.qq.com）
+    # 左侧：热门/搜索列表；右侧：漫画“播放区”（封面 + 简介 + 章节列表）
+    # ------------------------------------------------------------------
+    cartoon_top = tk.Frame(cartoon_tab, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_top.pack(side=tk.TOP, fill=tk.X, padx=12, pady=12)
+
+    tk.Label(cartoon_top, text="关键词:", bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT)
+    cartoon_kw_var = tk.StringVar(value="")
+    cartoon_kw_entry = tk.Entry(
+        cartoon_top,
+        width=28,
+        textvariable=cartoon_kw_var,
+        bg=UI_BG,
+        fg=UI_FG,
+        insertbackground=UI_FG,
+        bd=0,
+        highlightthickness=0,
+    )
+    cartoon_kw_entry.pack(side=tk.LEFT, padx=(8, 6))
+
+    cartoon_actions = tk.Frame(cartoon_top, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_actions.pack(side=tk.LEFT, padx=(0, 8))
+
+    cartoon_source_name_var = tk.StringVar(value="漫画源：漫客栈")
+
+    cartoon_alpha_frame = tk.Frame(cartoon_top, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_alpha_frame.pack(side=tk.RIGHT, padx=(0, 8))
+    tk.Label(cartoon_alpha_frame, text="透明度:", bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT)
+    cartoon_alpha = tk.DoubleVar(value=1.0)
+    tk.Scale(
+        cartoon_alpha_frame,
+        from_=0.15,
+        to=1.0,
+        resolution=0.05,
+        orient=tk.HORIZONTAL,
+        variable=cartoon_alpha,
+        command=lambda _v: set_root_alpha(cartoon_alpha.get()),
+        bg=UI_BG,
+        fg=UI_FG,
+        activebackground=UI_BG,
+        highlightthickness=0,
+        troughcolor=UI_BG,
+    ).pack(side=tk.LEFT, padx=(8, 0))
+
+    cartoon_main = tk.PanedWindow(cartoon_tab, orient=tk.HORIZONTAL, sashrelief=tk.FLAT, bg=UI_BG, bd=0)
+    cartoon_main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+    cartoon_left = tk.Frame(cartoon_main, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_right = tk.Frame(cartoon_main, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_main.add(cartoon_left, minsize=360)
+    cartoon_main.add(cartoon_right, minsize=680)
+
+    cartoon_left_top = tk.Frame(cartoon_left, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_left_top.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+    tk.Label(cartoon_left_top, text="漫画列表", bg=UI_BG, fg=UI_FG).pack(anchor="w")
+    cartoon_list_frame = tk.Frame(cartoon_left_top, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_list_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+    cartoon_listbox = tk.Listbox(
+        cartoon_list_frame,
+        bg=UI_BG,
+        fg=UI_FG,
+        selectbackground=UI_SEL_BG,
+        selectforeground=UI_SEL_FG,
+        highlightthickness=0,
+        bd=0,
+    )
+    cartoon_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    # 不显示显式 Scrollbar：通过鼠标滚轮/键盘仍可滚动（与视频区体验一致）
+
+    # 右侧作为纯展示区，不显示标题/简介，确保阅读时尽可能占满
+    cartoon_title_var = tk.StringVar(value="")
+    cartoon_intro_var = tk.StringVar(value="")
+
+    cartoon_cover_frame = tk.Frame(cartoon_right, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_cover_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
+    cartoon_cover_canvas = tk.Canvas(cartoon_cover_frame, bg=UI_BG, highlightthickness=0, height=300)
+    cartoon_cover_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    cartoon_left_bottom = tk.Frame(cartoon_left, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_left_bottom.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+    cartoon_chapter_header = tk.Frame(cartoon_left_bottom, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_chapter_header.pack(fill=tk.X)
+    tk.Label(cartoon_chapter_header, text="免费章节", bg=UI_BG, fg=UI_FG, anchor="w").pack(side=tk.LEFT)
+    cartoon_chapter_frame = tk.Frame(cartoon_left_bottom, bg=UI_BG, bd=0, highlightthickness=0)
+    cartoon_chapter_frame.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+    cartoon_chapter_list = tk.Listbox(
+        cartoon_chapter_frame,
+        bg=UI_BG,
+        fg=UI_FG,
+        selectbackground=UI_SEL_BG,
+        selectforeground=UI_SEL_FG,
+        highlightthickness=0,
+        bd=0,
+        height=10,
+    )
+    cartoon_chapter_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    cartoon_state: dict[str, Any] = {
+        "rows": [],
+        "chapters": [],
+        "cover_photo": None,
+        "cover_pil": None,
+        "current_url": "",
+        "loading": False,
+        "source_url": "https://www.mkzhan.com/",
+        "reader_pils": [],
+        "reader_photos": [],
+        "showing_chapter": False,
+    }
+
+    def _cartoon_redraw_reader_from_cache() -> None:
+        pils = cartoon_state.get("reader_pils") or []
+        if not pils:
+            return
+        try:
+            from PIL import Image, ImageTk
+        except Exception:
+            return
+        cartoon_state["reader_photos"] = []
+        cartoon_cover_canvas.delete("all")
+        try:
+            cartoon_cover_canvas.update_idletasks()
+            cw = max(600, int(cartoon_cover_canvas.winfo_width()))
+        except Exception:
+            cw = 900
+        x = cw // 2
+        y = 12
+        total_h = 0
+        for im in pils:
+            w, h = im.size
+            if w <= 0 or h <= 0:
+                continue
+            scale = min((cw - 24) / w, 1.0)
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            img2 = im if scale >= 0.999 else im.resize((nw, nh), resample=Image.LANCZOS)
+            ph = ImageTk.PhotoImage(img2)
+            cartoon_state["reader_photos"].append(ph)
+            cartoon_cover_canvas.create_image(x, y, image=ph, anchor="n")
+            y += nh + 12
+            total_h = y
+        cartoon_cover_canvas.configure(scrollregion=(0, 0, cw, max(total_h, 200)))
+
+    def _cur_source_url() -> str:
+        s = "https://www.mkzhan.com/"
+        cartoon_state["source_url"] = s
+        return s
+
+    def _cartoon_is_free_chapter(title: str) -> bool:
+        t = str(title or "").strip().upper()
+        if not t:
+            return False
+        # 腾讯动漫目录里带 APP 的条目通常为需客户端/付费章节
+        if "APP" in t:
+            return False
+        # 公告不作为可阅读章节
+        if "公告" in t:
+            return False
+        return True
+
+    def _cartoon_render_selected_chapter_images() -> None:
+        sel = cartoon_chapter_list.curselection()
+        if not sel:
+            set_status("请先选择章节")
+            return
+        idx = int(sel[0])
+        rows = cartoon_state.get("chapters") or []
+        if idx < 0 or idx >= len(rows):
+            set_status("章节索引无效")
+            return
+        chapter = rows[idx]
+        chapter_url = str(chapter.get("url") or "").strip()
+        chapter_title = str(chapter.get("title") or "").strip() or "章节"
+        if not chapter_url:
+            set_status("章节链接为空")
+            return
+        if not _cartoon_is_free_chapter(chapter_title):
+            set_status("当前章节非免费试读章节，无法内嵌渲染")
+            return
+
+        cartoon_state["showing_chapter"] = True
+
+        def _draw_images(pil_list: list[Any]) -> None:
+            try:
+                from PIL import Image, ImageTk
+            except Exception as e:  # noqa: BLE001
+                set_status(f"PIL 不可用: {e}")
+                return
+            cartoon_state["reader_pils"] = pil_list
+            cartoon_state["reader_photos"] = []
+            cartoon_cover_canvas.delete("all")
+            try:
+                cartoon_cover_canvas.update_idletasks()
+                cw = max(600, int(cartoon_cover_canvas.winfo_width()))
+            except Exception:
+                cw = 900
+            x = cw // 2
+            y = 12
+            total_h = 0
+            for im in pil_list:
+                w, h = im.size
+                if w <= 0 or h <= 0:
+                    continue
+                scale = min((cw - 24) / w, 1.0)
+                nw = max(1, int(w * scale))
+                nh = max(1, int(h * scale))
+                img2 = im if scale >= 0.999 else im.resize((nw, nh), resample=Image.LANCZOS)
+                ph = ImageTk.PhotoImage(img2)
+                cartoon_state["reader_photos"].append(ph)
+                cartoon_cover_canvas.create_image(x, y, image=ph, anchor="n")
+                y += nh + 12
+                total_h = y
+            cartoon_cover_canvas.configure(scrollregion=(0, 0, cw, max(total_h, 200)))
+
+        set_status("解析免费章节图片中…")
+
+        def worker() -> None:
+            try:
+                src_url = _cur_source_url()
+                img_urls = source_chapter_image_urls(src_url, chapter_url)
+                if not img_urls:
+                    raise BiqugeError("未解析到可公开图片")
+                # 限制渲染数量，避免极端章节导致内存飙升
+                img_urls = img_urls[:40]
+                pil_list: list[Any] = []
+                try:
+                    from PIL import Image
+                    import io
+                except Exception as e:  # noqa: BLE001
+                    raise BiqugeError(f"PIL 不可用: {e}") from e
+                for u in img_urls:
+                    try:
+                        raw = http_get(u, timeout=20, headers=source_cover_headers(src_url, referer=chapter_url))
+                        if not raw:
+                            continue
+                        im = Image.open(io.BytesIO(raw))
+                        im.load()
+                        pil_list.append(im)
+                    except Exception:
+                        continue
+                if not pil_list:
+                    raise BiqugeError("图片下载失败，可能为付费章节或防盗链限制")
+
+                def _apply() -> None:
+                    _draw_images(pil_list)
+                    set_status(f"已直渲染 {len(pil_list)} 张图片")
+
+                root.after(0, _apply)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+
+                def _apply_err() -> None:
+                    set_status(f"直渲染失败: {msg}")
+                    cartoon_state["showing_chapter"] = False
+
+                root.after(0, _apply_err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cartoon_rows_render(rows: list[TencentComicItem]) -> None:
+        cartoon_listbox.delete(0, tk.END)
+        cartoon_state["rows"] = rows
+        for i, it in enumerate(rows, start=1):
+            tag = "热门" if it.source == "hot" else "搜索"
+            cartoon_listbox.insert(tk.END, f"{i}. {it.title} [{tag}]")
+
+    def _cartoon_draw_cover() -> None:
+        pil = cartoon_state.get("cover_pil")
+        desc_text = str(cartoon_intro_var.get() or "").strip()
+        if pil is None:
+            try:
+                cartoon_cover_canvas.delete("all")
+                if desc_text:
+                    cartoon_cover_canvas.create_text(
+                        14,
+                        14,
+                        text=desc_text,
+                        fill=UI_FG,
+                        anchor="nw",
+                        font=("Arial", 11),
+                        width=max(280, int(cartoon_cover_canvas.winfo_width()) - 28),
+                    )
+                    cartoon_cover_canvas.configure(scrollregion=(0, 0, max(320, int(cartoon_cover_canvas.winfo_width())), 120))
+            except Exception:
+                pass
+            return
+        try:
+            from PIL import Image, ImageTk
+        except Exception:
+            return
+        try:
+            cw = max(320, int(cartoon_cover_canvas.winfo_width()))
+            ch = max(220, int(cartoon_cover_canvas.winfo_height()))
+        except Exception:
+            cw, ch = 700, 300
+        w, h = pil.size
+        if w <= 0 or h <= 0:
+            return
+        top_pad = 120 if desc_text else 0
+        available_h = max(80, ch - top_pad - 20)
+        scale = min((cw - 20) / w, available_h / h, 1.0)
+        nw = max(1, int(w * scale))
+        nh = max(1, int(h * scale))
+        img = pil if scale >= 0.999 else pil.resize((nw, nh), resample=Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        cartoon_state["cover_photo"] = photo
+        cartoon_cover_canvas.delete("all")
+        cartoon_cover_canvas.create_image(cw // 2, top_pad + 10, image=photo, anchor="n")
+        if desc_text:
+            cartoon_cover_canvas.create_text(
+                14,
+                14,
+                text=desc_text,
+                fill=UI_FG,
+                anchor="nw",
+                font=("Arial", 11),
+                width=max(280, cw - 28),
+            )
+        cartoon_cover_canvas.configure(scrollregion=(0, 0, cw, max(top_pad + nh + 24, ch, 320)))
+
+    def _cartoon_open_current() -> None:
+        u = str(cartoon_state.get("current_url") or "").strip()
+        if not u:
+            return
+        try:
+            webbrowser.open(u)
+        except Exception:
+            pass
+
+    def _cartoon_open_selected_chapter(_e: Any = None) -> None:
+        sel = cartoon_chapter_list.curselection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        rows = cartoon_state.get("chapters") or []
+        if idx < 0 or idx >= len(rows):
+            return
+        u = str(rows[idx].get("url") or "").strip()
+        if not u:
+            return
+        _cartoon_render_selected_chapter_images()
+
+    def _cartoon_load_detail(item: TencentComicItem) -> None:
+        if cartoon_state.get("loading"):
+            return
+        cartoon_state["loading"] = True
+        set_status("加载漫画详情中…")
+
+        def worker() -> None:
+            try:
+                src_url = _cur_source_url()
+                detail = source_comic_detail(src_url, item)
+                cover_raw = b""
+                if detail.cover_url:
+                    try:
+                        cover_raw = http_get(
+                            detail.cover_url,
+                            timeout=20,
+                            headers=source_cover_headers(src_url, referer=detail.comic_url),
+                        )
+                    except Exception:
+                        cover_raw = b""
+
+                def _apply() -> None:
+                    cartoon_title_var.set(detail.title)
+                    cartoon_intro_var.set(detail.intro or "暂无简介")
+                    cartoon_state["current_url"] = detail.comic_url
+                    cartoon_chapter_list.delete(0, tk.END)
+                    cartoon_state["reader_pils"] = []
+                    cartoon_state["reader_photos"] = []
+                    cartoon_state["showing_chapter"] = False
+                    cartoon_cover_canvas.delete("all")
+                    cartoon_cover_canvas.configure(scrollregion=(0, 0, 800, 320))
+                    free_rows = [c for c in detail.chapters if _cartoon_is_free_chapter(c.title)]
+                    cartoon_state["chapters"] = [{"title": c.title, "url": c.url} for c in free_rows]
+                    for i, c in enumerate(free_rows[:400], start=1):
+                        cartoon_chapter_list.insert(tk.END, f"{i}. {c.title}")
+
+                    cartoon_state["cover_pil"] = None
+                    if cover_raw:
+                        try:
+                            from PIL import Image
+
+                            import io
+
+                            im = Image.open(io.BytesIO(cover_raw))
+                            im.load()
+                            cartoon_state["cover_pil"] = im
+                        except Exception:
+                            cartoon_state["cover_pil"] = None
+                    _cartoon_draw_cover()
+                    cartoon_state["loading"] = False
+                    set_status(f"已加载：{detail.title}（免费章节 {len(free_rows)}）")
+
+                root.after(0, _apply)
+            except Exception as e:  # noqa: BLE001
+                msg = str(e)
+
+                def _apply_err() -> None:
+                    cartoon_state["loading"] = False
+                    set_status(f"漫画详情加载失败: {msg}")
+
+                root.after(0, _apply_err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cartoon_on_pick(_e: Any = None) -> None:
+        sel = cartoon_listbox.curselection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        rows = cartoon_state.get("rows") or []
+        if idx < 0 or idx >= len(rows):
+            return
+        _cartoon_load_detail(rows[idx])
+
+    def _cartoon_cover_wheel(e: Any) -> str:
+        # 兼容 Windows/macOS 的滚轮事件
+        d = int(getattr(e, "delta", 0) or 0)
+        if d == 0:
+            return "break"
+        step = -1 if d > 0 else 1
+        cartoon_cover_canvas.yview_scroll(step, "units")
+        return "break"
+
+    def _cartoon_cover_btn4(_e: Any) -> str:
+        # 兼容部分 Linux/X11（滚轮上）
+        cartoon_cover_canvas.yview_scroll(-1, "units")
+        return "break"
+
+    def _cartoon_cover_btn5(_e: Any) -> str:
+        # 兼容部分 Linux/X11（滚轮下）
+        cartoon_cover_canvas.yview_scroll(1, "units")
+        return "break"
+
+    def cartoon_load_hot() -> None:
+        src_url = _cur_source_url()
+        info = analyze_cartoon_source(src_url)
+        if info.source_type == "unknown":
+            set_status("该漫画源暂不支持，当前仅支持 https://www.mkzhan.com/")
+            return
+        set_status("加载热门漫画中…")
+
+        def worker() -> None:
+            try:
+                rows = source_hot_comics(src_url, limit=120)
+                root.after(
+                    0,
+                    lambda: (
+                        _cartoon_rows_render(rows),
+                        set_status(f"[{info.source_name}] 热门已加载：{len(rows)} 条"),
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                err_msg = str(e)
+                root.after(0, lambda err_msg=err_msg: set_status(f"热门漫画加载失败: {err_msg}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def cartoon_search() -> None:
+        kw = cartoon_kw_var.get().strip()
+        if not kw:
+            set_status("请输入关键词")
+            return
+        src_url = _cur_source_url()
+        info = analyze_cartoon_source(src_url)
+        if info.source_type == "unknown":
+            set_status("该漫画源暂不支持，当前仅支持 https://www.mkzhan.com/")
+            return
+        set_status(f"搜索中: {kw}")
+
+        def worker() -> None:
+            try:
+                rows = source_search_comics(src_url, kw, limit=120)
+                suffix = f"（{info.note}）" if info.note else ""
+                root.after(0, lambda: (_cartoon_rows_render(rows), set_status(f"[{info.source_name}] 搜索完成：{len(rows)} 条{suffix}")))
+            except Exception as e:  # noqa: BLE001
+                err_msg = str(e)
+                root.after(0, lambda err_msg=err_msg: set_status(f"搜索失败: {err_msg}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    _make_flat_button(cartoon_actions, "搜索", cartoon_search).pack(side=tk.LEFT, padx=6)
+    tk.Label(cartoon_actions, textvariable=cartoon_source_name_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(8, 6))
+    _make_flat_button(cartoon_actions, "热门", cartoon_load_hot).pack(side=tk.LEFT, padx=6)
+    _make_flat_button(cartoon_chapter_header, "开始", _cartoon_render_selected_chapter_images).pack(side=tk.RIGHT, padx=6)
+
+    cartoon_listbox.bind("<<ListboxSelect>>", _cartoon_on_pick)
+    cartoon_chapter_list.bind("<<ListboxSelect>>", lambda _e: _cartoon_render_selected_chapter_images())
+    cartoon_chapter_list.bind("<Double-Button-1>", _cartoon_open_selected_chapter)
+    cartoon_kw_entry.bind("<Return>", lambda _e: cartoon_search())
+    cartoon_cover_canvas.bind(
+        "<Configure>",
+        lambda _e: _cartoon_redraw_reader_from_cache() if cartoon_state.get("showing_chapter") else _cartoon_draw_cover(),
+    )
+    cartoon_cover_canvas.bind("<MouseWheel>", _cartoon_cover_wheel)
+    cartoon_cover_canvas.bind("<Button-4>", _cartoon_cover_btn4)
+    cartoon_cover_canvas.bind("<Button-5>", _cartoon_cover_btn5)
+    cartoon_load_hot()
 
     _make_flat_button(fund_btns, "新增", fund_add_button).pack(side=tk.LEFT, padx=6)
     _make_flat_button(fund_btns, "移除所选", fund_remove_selected_button).pack(side=tk.LEFT, padx=6)
