@@ -8,6 +8,7 @@ import re
 import signal
 import socket
 import subprocess
+import random
 import uuid
 import tempfile
 import threading
@@ -669,6 +670,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     fund_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     video_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     music_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
+    game_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     cartoon_tab = tk.Frame(notebook, bg=UI_BG, bd=0, highlightthickness=0)
     notebook.add(home, text="首页")
     notebook.add(reader_tab, text="阅读")
@@ -676,6 +678,328 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     notebook.add(video_tab, text="视频")
     notebook.add(music_tab, text="音乐")
     notebook.add(cartoon_tab, text="漫画")
+    notebook.add(game_tab, text="游戏")
+    # ------------------------------------------------------------------
+    # 游戏：简易基地建设策略（键盘产兵 + 自动交战 + 关卡推进）
+    # ------------------------------------------------------------------
+    game_top = tk.Frame(game_tab, bg=UI_BG, bd=0, highlightthickness=0)
+    game_top.pack(side=tk.TOP, fill=tk.X, padx=12, pady=(12, 8))
+
+    game_level_var = tk.StringVar(value="关卡: 1")
+    game_status_var = tk.StringVar(value="状态: 待开始")
+    game_keys_var = tk.StringVar(value="敲击进度: 0/12")
+    game_hint_var = tk.StringVar(value="提示: 切到“游戏”页后敲键盘可产兵")
+    game_phase_var = tk.StringVar(value="阶段: 待开始")
+    game_timer_var = tk.StringVar(value="发育倒计时: --")
+    tk.Label(game_top, textvariable=game_level_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(0, 12))
+    tk.Label(game_top, textvariable=game_status_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(0, 12))
+    tk.Label(game_top, textvariable=game_keys_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(0, 12))
+    tk.Label(game_top, textvariable=game_phase_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(0, 12))
+    tk.Label(game_top, textvariable=game_timer_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(0, 12))
+    tk.Label(game_top, textvariable=game_hint_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(0, 12))
+
+    game_btns = tk.Frame(game_top, bg=UI_BG, bd=0, highlightthickness=0)
+    game_btns.pack(side=tk.RIGHT)
+
+    game_main = tk.Frame(game_tab, bg=UI_BG, bd=0, highlightthickness=0)
+    game_main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+
+    game_info = tk.Frame(game_main, bg=UI_BG, bd=0, highlightthickness=0)
+    game_info.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+    game_own_var = tk.StringVar(value="我方: 士兵0 弓手0 骑士0")
+    game_enemy_var = tk.StringVar(value="敌方: 士兵0 弓手0 骑士0")
+    game_mid_var = tk.StringVar(value="战况: 未开始")
+    game_left_card = tk.Frame(game_info, bg=UI_BG, bd=1, highlightthickness=1, highlightbackground=UI_FG)
+    game_left_card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+    game_mid_card = tk.Frame(game_info, bg=UI_BG, bd=1, highlightthickness=1, highlightbackground=UI_FG)
+    game_mid_card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+    game_right_card = tk.Frame(game_info, bg=UI_BG, bd=1, highlightthickness=1, highlightbackground=UI_FG)
+    game_right_card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+    tk.Label(game_left_card, text="我方基地", bg=UI_BG, fg=UI_FG).pack(anchor="w", padx=8, pady=(6, 2))
+    tk.Label(game_left_card, textvariable=game_own_var, bg=UI_BG, fg=UI_FG).pack(anchor="w", padx=8, pady=(0, 6))
+    tk.Label(game_mid_card, text="中部战线", bg=UI_BG, fg=UI_FG).pack(anchor="center", pady=(6, 2))
+    tk.Label(game_mid_card, textvariable=game_mid_var, bg=UI_BG, fg=UI_FG).pack(anchor="center", pady=(0, 6))
+    tk.Label(game_right_card, text="敌方基地", bg=UI_BG, fg=UI_FG).pack(anchor="e", padx=8, pady=(6, 2))
+    tk.Label(game_right_card, textvariable=game_enemy_var, bg=UI_BG, fg=UI_FG).pack(anchor="e", padx=8, pady=(0, 6))
+
+    game_board = tk.Canvas(game_main, bg=UI_BG, bd=0, highlightthickness=0)
+    game_board.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    game_levels: list[dict[str, Any]] = [
+        {"name": "新兵试炼", "enemy_start": {"soldier": 10, "archer": 2, "knight": 0}, "enemy_growth_ms": 2400},
+        {"name": "边境冲突", "enemy_start": {"soldier": 16, "archer": 5, "knight": 1}, "enemy_growth_ms": 1900},
+        {"name": "要塞围攻", "enemy_start": {"soldier": 22, "archer": 8, "knight": 3}, "enemy_growth_ms": 1500},
+        {"name": "王城决战", "enemy_start": {"soldier": 30, "archer": 12, "knight": 6}, "enemy_growth_ms": 1200},
+    ]
+    game_state: dict[str, Any] = {
+        "running": False,
+        "tick_job": None,
+        "enemy_job": None,
+        "prep_job": None,
+        "level_idx": 0,
+        "threshold": 12,
+        "key_count": 0,
+        "prep_sec": 10,
+        "prep_left": 0,
+        "battle_started": False,
+        "board_ready": False,
+        "board_items": {},
+        "own": {"soldier": 1, "archer": 0, "knight": 0},
+        "enemy": {"soldier": 0, "archer": 0, "knight": 0},
+    }
+    game_unit_hp = {"soldier": 10, "archer": 8, "knight": 18}
+    game_unit_power = {"soldier": 1.1, "archer": 1.7, "knight": 3.2}
+    game_units = ("soldier", "archer", "knight")
+    game_unit_name = {"soldier": "士兵", "archer": "弓手", "knight": "骑士"}
+    game_spawn_weights = (("soldier", 60), ("archer", 30), ("knight", 10))
+
+    def _game_sum(side: dict[str, int]) -> int:
+        return int(side.get("soldier", 0)) + int(side.get("archer", 0)) + int(side.get("knight", 0))
+
+    def _game_calc_hp(side: dict[str, int]) -> float:
+        return sum(float(side.get(k, 0)) * game_unit_hp[k] for k in game_units)
+
+    def _game_calc_power(side: dict[str, int]) -> float:
+        return sum(float(side.get(k, 0)) * game_unit_power[k] for k in game_units)
+
+    def _game_apply_damage(side: dict[str, int], damage: float) -> None:
+        remain = max(0.0, float(damage))
+        # 先消耗低阶单位，避免骑士被瞬间清空导致体验不稳定
+        for k in ("soldier", "archer", "knight"):
+            if remain <= 0:
+                break
+            cnt = int(side.get(k, 0))
+            if cnt <= 0:
+                continue
+            kill = min(cnt, int(remain / game_unit_hp[k]))
+            if kill > 0:
+                side[k] = cnt - kill
+                remain -= kill * game_unit_hp[k]
+        if remain > 0:
+            for k in ("soldier", "archer", "knight"):
+                if side.get(k, 0) > 0:
+                    side[k] = max(0, int(side[k]) - 1)
+                    break
+
+    def _game_ensure_board_items() -> None:
+        if game_state.get("board_ready"):
+            return
+        items: dict[str, int] = {}
+        items["outer"] = game_board.create_rectangle(20, 20, 120, 120, outline=UI_FG, width=1)
+        items["midline"] = game_board.create_line(60, 20, 60, 120, fill=UI_FG)
+        items["left_base"] = game_board.create_text(120, 40, text="我方基地", fill=UI_FG, anchor="w")
+        items["right_base"] = game_board.create_text(220, 40, text="敌方基地", fill=UI_FG, anchor="w")
+        items["phase"] = game_board.create_text(160, 40, text="发育中", fill=UI_FG)
+        items["left_bar_outline"] = game_board.create_rectangle(40, 80, 100, 100, outline=UI_FG, width=1)
+        items["right_bar_outline"] = game_board.create_rectangle(120, 80, 180, 100, outline=UI_FG, width=1)
+        items["left_bar_fill"] = game_board.create_rectangle(40, 80, 40, 100, fill="#4CAF50", width=0)
+        items["right_bar_fill"] = game_board.create_rectangle(180, 80, 180, 100, fill="#E53935", width=0)
+        items["left_power"] = game_board.create_text(40, 72, text="", fill=UI_FG, anchor="w")
+        items["right_power"] = game_board.create_text(120, 72, text="", fill=UI_FG, anchor="w")
+        items["left_units"] = game_board.create_text(36, 76, text="", fill=UI_FG, anchor="w")
+        items["right_units"] = game_board.create_text(220, 76, text="", fill=UI_FG, anchor="e")
+        game_state["board_items"] = items
+        game_state["board_ready"] = True
+
+    def _game_render() -> None:
+        own = game_state["own"]
+        enemy = game_state["enemy"]
+        own_total = _game_sum(own)
+        enemy_total = _game_sum(enemy)
+        game_own_var.set(f"我方: 士兵{own['soldier']} 弓手{own['archer']} 骑士{own['knight']}（总{own_total}）")
+        game_enemy_var.set(f"敌方: 士兵{enemy['soldier']} 弓手{enemy['archer']} 骑士{enemy['knight']}（总{enemy_total}）")
+        game_keys_var.set(f"敲击进度: {game_state['key_count']}/{game_state['threshold']}")
+        if game_state.get("battle_started"):
+            game_phase_var.set("阶段: 战斗中")
+            game_timer_var.set("发育倒计时: 0s")
+            game_mid_var.set("战况: 双方交战中")
+        elif game_state.get("running"):
+            left = int(game_state.get("prep_left", 0))
+            game_phase_var.set("阶段: 发育中")
+            game_timer_var.set(f"发育倒计时: {left}s")
+            game_mid_var.set("战况: 发育期（暂不交战）")
+        else:
+            game_phase_var.set("阶段: 待命")
+            game_timer_var.set("发育倒计时: --")
+            game_mid_var.set("战况: 未开始")
+
+        _game_ensure_board_items()
+        game_board.update_idletasks()
+        w = max(900, int(game_board.winfo_width()))
+        h = max(300, int(game_board.winfo_height()))
+        items: dict[str, int] = game_state["board_items"]
+        game_board.coords(items["outer"], 20, 20, w - 20, h - 20)
+        game_board.coords(items["midline"], w // 2, 20, w // 2, h - 20)
+        game_board.coords(items["left_base"], 120, 40)
+        game_board.coords(items["right_base"], w - 220, 40)
+        game_board.coords(items["phase"], w // 2, 40)
+        game_board.itemconfigure(items["phase"], text=("发育中" if not game_state.get("battle_started") and game_state.get("running") else "交战中"))
+
+        own_hp = _game_calc_hp(own)
+        enemy_hp = _game_calc_hp(enemy)
+        hp_sum = max(1.0, own_hp + enemy_hp)
+        own_ratio = own_hp / hp_sum
+        enemy_ratio = enemy_hp / hp_sum
+        bar_y1 = h - 65
+        bar_y2 = h - 35
+        left_x = 40
+        mid_x = w // 2 - 10
+        right_x = w - 40
+        game_board.coords(items["left_bar_outline"], left_x, bar_y1, mid_x, bar_y2)
+        game_board.coords(items["right_bar_outline"], w // 2 + 10, bar_y1, right_x, bar_y2)
+        game_board.coords(items["left_bar_fill"], left_x, bar_y1, left_x + int((mid_x - left_x) * own_ratio), bar_y2)
+        game_board.coords(items["right_bar_fill"], right_x - int((right_x - (w // 2 + 10)) * enemy_ratio), bar_y1, right_x, bar_y2)
+        game_board.coords(items["left_power"], left_x, bar_y1 - 8)
+        game_board.coords(items["right_power"], w // 2 + 10, bar_y1 - 8)
+        game_board.itemconfigure(items["left_power"], text=f"我方战力 {own_hp:.1f}")
+        game_board.itemconfigure(items["right_power"], text=f"敌方战力 {enemy_hp:.1f}")
+        game_board.coords(items["left_units"], 36, 76)
+        game_board.coords(items["right_units"], w - 36, 76)
+        game_board.itemconfigure(items["left_units"], text=f"士兵 {own['soldier']}  弓手 {own['archer']}  骑士 {own['knight']}")
+        game_board.itemconfigure(items["right_units"], text=f"士兵 {enemy['soldier']}  弓手 {enemy['archer']}  骑士 {enemy['knight']}")
+
+    def _game_refresh_key_progress() -> None:
+        game_keys_var.set(f"敲击进度: {game_state['key_count']}/{game_state['threshold']}")
+
+    def _game_stop_jobs() -> None:
+        for job_key in ("tick_job", "enemy_job", "prep_job"):
+            job = game_state.get(job_key)
+            if job is not None:
+                try:
+                    root.after_cancel(job)
+                except Exception:
+                    pass
+                game_state[job_key] = None
+
+    def _game_enemy_spawn_loop() -> None:
+        if not game_state.get("running") or not game_state.get("battle_started"):
+            return
+        lv = game_levels[int(game_state["level_idx"])]
+        enemy = game_state["enemy"]
+        pick = random.choices(["soldier", "archer", "knight"], weights=[55, 30, 15], k=1)[0]
+        # 高关卡额外补兵，强化压迫感
+        add_n = 1 + (1 if int(game_state["level_idx"]) >= 2 and random.random() < 0.35 else 0)
+        enemy[pick] = int(enemy.get(pick, 0)) + add_n
+        _game_render()
+        game_state["enemy_job"] = root.after(int(lv["enemy_growth_ms"]), _game_enemy_spawn_loop)
+
+    def _game_finish(win: bool) -> None:
+        game_state["running"] = False
+        _game_stop_jobs()
+        if win:
+            if int(game_state["level_idx"]) < len(game_levels) - 1:
+                game_status_var.set("状态: 胜利")
+                game_hint_var.set("提示: 本关已胜利，点击“下一关”继续")
+                set_status("游戏：本关胜利")
+            else:
+                game_status_var.set("状态: 全部通关")
+                game_hint_var.set("提示: 你已完成全部关卡，可重开挑战")
+                set_status("游戏：全部关卡通关")
+        else:
+            game_status_var.set("状态: 失败")
+            game_hint_var.set("提示: 你被压制了，点击“重新开始”再试一次")
+            set_status("游戏：战斗失败")
+        _game_render()
+
+    def _game_tick() -> None:
+        if not game_state.get("running") or not game_state.get("battle_started"):
+            return
+        own = game_state["own"]
+        enemy = game_state["enemy"]
+        own_damage = _game_calc_power(own) * 0.42
+        enemy_damage = _game_calc_power(enemy) * 0.37
+        _game_apply_damage(enemy, own_damage)
+        _game_apply_damage(own, enemy_damage)
+        _game_render()
+        if _game_sum(enemy) <= 0:
+            _game_finish(True)
+            return
+        if _game_sum(own) <= 0:
+            _game_finish(False)
+            return
+        game_state["tick_job"] = root.after(700, _game_tick)
+
+    def _game_prep_tick() -> None:
+        if not game_state.get("running"):
+            return
+        left = int(game_state.get("prep_left", 0)) - 1
+        game_state["prep_left"] = max(0, left)
+        if left <= 0:
+            game_state["battle_started"] = True
+            game_status_var.set("状态: 进行中")
+            game_hint_var.set("提示: 战斗开始，继续敲击键盘扩军")
+            _game_render()
+            _game_tick()
+            lv = game_levels[int(game_state["level_idx"])]
+            game_state["enemy_job"] = root.after(int(lv["enemy_growth_ms"]), _game_enemy_spawn_loop)
+            return
+        _game_render()
+        game_state["prep_job"] = root.after(1000, _game_prep_tick)
+
+    def _game_start_level(reset_own: bool = True) -> None:
+        _game_stop_jobs()
+        lv = game_levels[int(game_state["level_idx"])]
+        if reset_own:
+            game_state["own"] = {"soldier": 1, "archer": 0, "knight": 0}
+        game_state["enemy"] = dict(lv["enemy_start"])
+        game_state["key_count"] = 0
+        game_state["running"] = True
+        game_state["battle_started"] = False
+        game_state["prep_left"] = int(game_state["prep_sec"])
+        game_level_var.set(f"关卡: {int(game_state['level_idx']) + 1} / {len(game_levels)}（{lv['name']}）")
+        game_status_var.set("状态: 发育中")
+        game_hint_var.set("提示: 先发育10秒，期间敲击键盘可提前扩军")
+        _game_render()
+        game_state["prep_job"] = root.after(1000, _game_prep_tick)
+        set_status(f"游戏：开始 {lv['name']}")
+
+    def _game_restart() -> None:
+        _game_start_level(reset_own=True)
+
+    def _game_next_level() -> None:
+        if int(game_state["level_idx"]) >= len(game_levels) - 1:
+            set_status("游戏：已是最后一关")
+            return
+        game_state["level_idx"] = int(game_state["level_idx"]) + 1
+        _game_start_level(reset_own=True)
+
+    def _game_spawn_by_keys() -> None:
+        pick = random.choices([x[0] for x in game_spawn_weights], weights=[x[1] for x in game_spawn_weights], k=1)[0]
+        game_state["own"][pick] = int(game_state["own"].get(pick, 0)) + 1
+        game_hint_var.set(f"提示: 产兵成功，新增 {game_unit_name[pick]} x1")
+        _game_render()
+
+    def _game_on_key(_e: Any) -> None:
+        try:
+            current_widget = notebook.nametowidget(notebook.select())
+        except Exception:
+            current_widget = None
+        if current_widget is not game_tab:
+            return
+        if not game_state.get("running"):
+            return
+        ks = getattr(_e, "keysym", "") or ""
+        ch = str(getattr(_e, "char", "") or "")
+        if ks in {"Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock", "Tab"}:
+            return
+        # 只过滤纯功能键，其他按键都计入敲击，提升可触发性
+        if not ch and ks not in {"space", "Return", "BackSpace"} and ks.startswith(("F", "Escape", "Up", "Down", "Left", "Right")):
+            return
+        game_state["key_count"] = int(game_state["key_count"]) + 1
+        spawned = False
+        while int(game_state["key_count"]) >= int(game_state["threshold"]):
+            game_state["key_count"] = int(game_state["key_count"]) - int(game_state["threshold"])
+            _game_spawn_by_keys()
+            spawned = True
+        if not spawned:
+            # 按键时仅更新进度文本，避免频繁整画布重绘导致闪烁
+            _game_refresh_key_progress()
+
+    _make_flat_button(game_btns, "开始", _game_restart).pack(side=tk.LEFT)
+    _make_flat_button(game_btns, "下一关", _game_next_level).pack(side=tk.LEFT, padx=(8, 0))
+    root.bind_all("<KeyPress>", _game_on_key, add="+")
+    game_board.bind("<Configure>", lambda _e: _game_render())
+    _game_render()
 
     # ------------------------------------------------------------------
     # 基金：输入基金代码 + 持有份额，点击“新增”获取净值信息
@@ -1175,13 +1499,13 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     cartoon_source_map = {
         "all": "全部源",
         "mkzhan": "漫客栈",
-        "bilimanga": "哔哩漫画",
         "mangacopy": "拷贝漫画",
+        # "dm5": "动漫屋",
     }
     cartoon_source_url_map = {
         "mkzhan": "https://www.mkzhan.com/",
-        "bilimanga": "https://www.bilimanga.net/",
         "mangacopy": "https://www.mangacopy.com/",
+        # "dm5": "https://www.dm5.com/",
     }
     cartoon_source_choice_var = tk.StringVar(value=cartoon_source_map["all"])
     cartoon_source_name_var = tk.StringVar(value=f"漫画源")
@@ -1327,7 +1651,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
     def _open_cartoon_source_menu(_e: Any = None) -> None:
         m = tk.Menu(root, tearoff=0, bg=UI_BG, fg=UI_FG, bd=0, activebackground=UI_SEL_BG, activeforeground=UI_SEL_FG)
-        for key in ("all", "mkzhan", "bilimanga", "mangacopy"):
+        for key in ("all", "mkzhan", "mangacopy"):
             label = cartoon_source_map[key]
             m.add_command(label=label, command=lambda k=key: _set_cartoon_source(k))
         try:
@@ -1639,7 +1963,8 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                     merged: list[TencentComicItem] = []
                     seen: set[str] = set()
                     ok_sources = 0
-                    for key in ("mkzhan", "bilimanga", "mangacopy"):
+                    active_sources = ("mkzhan", "mangacopy")
+                    for key in active_sources:
                         su = cartoon_source_url_map[key]
                         info2 = analyze_cartoon_source(su)
                         try:
@@ -1657,7 +1982,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                         0,
                         lambda: (
                             _cartoon_rows_render(merged),
-                            set_status(f"[全部源] 热门已加载：{len(merged)} 条（成功源 {ok_sources}/3）"),
+                            set_status(f"[全部源] 热门已加载：{len(merged)} 条（成功源 {ok_sources}/{len(active_sources)}）"),
                         ),
                     )
                     return
@@ -1687,7 +2012,8 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                     merged: list[TencentComicItem] = []
                     seen: set[str] = set()
                     ok_sources = 0
-                    for key in ("mkzhan", "bilimanga", "mangacopy"):
+                    active_sources = ("mkzhan", "mangacopy")
+                    for key in active_sources:
                         su = cartoon_source_url_map[key]
                         info2 = analyze_cartoon_source(su)
                         try:
@@ -1705,7 +2031,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                         0,
                         lambda: (
                             _cartoon_rows_render(merged),
-                            set_status(f"[全部源] 搜索完成：{len(merged)} 条（成功源 {ok_sources}/3）"),
+                            set_status(f"[全部源] 搜索完成：{len(merged)} 条（成功源 {ok_sources}/{len(active_sources)}）"),
                         ),
                     )
                     return
