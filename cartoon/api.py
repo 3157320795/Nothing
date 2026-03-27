@@ -9,6 +9,8 @@ from src.common import BiqugeError, http_get
 
 _BASE_PC = "https://ac.qq.com/"
 _BASE_M = "https://m.ac.qq.com/"
+_BILIMANGA_BASE = "https://www.bilimanga.net/"
+_MANGACOPY_BASE = "https://www.mangacopy.com/"
 
 
 @dataclass(frozen=True)
@@ -253,6 +255,10 @@ def _source_type_from_url(source_url: str) -> str:
     u = str(source_url or "").strip().lower()
     if "mkzhan.com" in u:
         return "mkzhan"
+    if "bilimanga.net" in u or "bilimicro.top" in u:
+        return "bilimanga"
+    if "mangacopy.com" in u or "2026copy.com" in u:
+        return "mangacopy"
     return "unknown"
 
 
@@ -260,31 +266,386 @@ def analyze_cartoon_source(source_url: str) -> CartoonSourceAnalysis:
     st = _source_type_from_url(source_url)
     if st == "mkzhan":
         return CartoonSourceAnalysis(source_url=source_url, source_name="漫客栈", source_type=st, has_hot=True, has_search=True, note="使用站内开放接口与首页榜单进行自动分析")
-    return CartoonSourceAnalysis(source_url=source_url, source_name="未知站点", source_type=st, has_hot=False, has_search=False, note="当前版本仅支持 https://www.mkzhan.com/")
+    if st == "bilimanga":
+        return CartoonSourceAnalysis(
+            source_url=source_url,
+            source_name="哔哩漫画",
+            source_type=st,
+            has_hot=True,
+            has_search=True,
+            note="通过公开页面抓取；若触发 Cloudflare 风控，详情/章节可能失败",
+        )
+    if st == "mangacopy":
+        return CartoonSourceAnalysis(
+            source_url=source_url,
+            source_name="拷贝漫画",
+            source_type=st,
+            has_hot=True,
+            has_search=True,
+            note="通过首页/榜单公开页面抓取，详情与章节解析为通用规则",
+        )
+    return CartoonSourceAnalysis(
+        source_url=source_url,
+        source_name="未知站点",
+        source_type=st,
+        has_hot=False,
+        has_search=False,
+        note="当前版本支持 https://www.mkzhan.com/、https://www.bilimanga.net/ 与 https://www.mangacopy.com/",
+    )
 
 
-def _mkzhan_hot_comics(*, limit: int = 120) -> list[TencentComicItem]:
-    raw = http_get("https://www.mkzhan.com/", timeout=20, headers={"Referer": "https://www.mkzhan.com/"})
+def _common_html_headers(*, referer: str) -> dict[str, str]:
+    return {
+        "Referer": referer,
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+
+def _bilimanga_extract_items(text: str, *, source: str) -> list[TencentComicItem]:
+    pat = re.compile(r"<a[^>]+href=[\"']([^\"']*/detail/(\d+)\.html)['\"][^>]*>(.*?)</a>", re.I | re.S)
+    seen: set[str] = set()
+    out: list[TencentComicItem] = []
+    for href, cid, label in pat.findall(text):
+        if not cid or cid in seen:
+            continue
+        title = _strip_tags(label)
+        if not title:
+            continue
+        seen.add(cid)
+        url = urllib.parse.urljoin(_BILIMANGA_BASE, href)
+        out.append(TencentComicItem(comic_id=cid, title=title, url=url, source=source))
+    return out
+
+
+def _bilimanga_hot_comics(*, limit: int = 240) -> list[TencentComicItem]:
+    seeds = [
+        _BILIMANGA_BASE,
+        f"{_BILIMANGA_BASE}sort/",
+        f"{_BILIMANGA_BASE}top/monthvisit/1.html",
+        f"{_BILIMANGA_BASE}top/weekvisit/1.html",
+    ]
+    max_n = max(1, int(limit))
+    seen: set[str] = set()
+    out: list[TencentComicItem] = []
+    for seed in seeds:
+        try:
+            raw = http_get(seed, timeout=20, headers=_common_html_headers(referer=_BILIMANGA_BASE))
+            text = _decode_html(raw)
+        except Exception:
+            continue
+        for it in _bilimanga_extract_items(text, source="hot"):
+            if it.comic_id in seen:
+                continue
+            seen.add(it.comic_id)
+            out.append(it)
+            if len(out) >= max_n:
+                return out
+    if not out:
+        raise BiqugeError("bilimanga 热门抓取为空，可能触发了 Cloudflare 风控")
+    return out
+
+
+def _bilimanga_search_comics(keyword: str, *, limit: int = 120) -> list[TencentComicItem]:
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    q = urllib.parse.quote(kw, safe="")
+    # 该站检索页参数兼容性不稳定，先尝试 query，再回退到热门本地过滤
+    seeds = [
+        f"{_BILIMANGA_BASE}search.html?keyword={q}",
+        f"{_BILIMANGA_BASE}search.html?wd={q}",
+        f"{_BILIMANGA_BASE}search.html?key={q}",
+    ]
+    seen: set[str] = set()
+    out: list[TencentComicItem] = []
+    for seed in seeds:
+        try:
+            raw = http_get(seed, timeout=20, headers=_common_html_headers(referer=_BILIMANGA_BASE))
+            text = _decode_html(raw)
+        except Exception:
+            continue
+        for it in _bilimanga_extract_items(text, source="search"):
+            if it.comic_id in seen:
+                continue
+            seen.add(it.comic_id)
+            out.append(it)
+            if len(out) >= limit:
+                return out
+    if out:
+        return out[:limit]
+    hot = _bilimanga_hot_comics(limit=400)
+    q2 = kw.lower()
+    return [x for x in hot if q2 in x.title.lower()][:limit]
+
+
+def _bilimanga_comic_detail(comic_id_or_url: str) -> TencentComicDetail:
+    s = str(comic_id_or_url or "").strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        u = s
+    else:
+        cid = re.sub(r"\D", "", s)
+        if not cid:
+            raise BiqugeError("bilimanga comic_id 为空")
+        u = f"{_BILIMANGA_BASE}detail/{cid}.html"
+    m = re.search(r"/detail/(\d+)\.html", u, flags=re.I)
+    comic_id = m.group(1) if m else re.sub(r"\D", "", u)
+    raw = http_get(u, timeout=20, headers=_common_html_headers(referer=_BILIMANGA_BASE))
     text = _decode_html(raw)
+    low = text.lower()
+    if "attention required! | cloudflare" in low or "sorry, you have been blocked" in low:
+        raise BiqugeError("bilimanga 触发 Cloudflare 风控，请稍后重试或切换漫客栈")
+    title = _first_match(
+        text,
+        [
+            r"<h1[^>]*>(.*?)</h1>",
+            r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            r"<title[^>]*>(.*?)</title>",
+        ],
+    )
+    intro = _first_match(
+        text,
+        [
+            r"<meta[^>]+name=[\"']description[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            r"<div[^>]+class=[\"'][^\"']*(?:intro|desc|summary|content)[^\"']*[\"'][^>]*>(.*?)</div>",
+            r"<p[^>]+class=[\"'][^\"']*(?:intro|desc|summary|content)[^\"']*[\"'][^>]*>(.*?)</p>",
+        ],
+    )
+    cover = _first_match(
+        text,
+        [
+            r"<meta[^>]+property=[\"']og:image[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            r"<img[^>]+class=[\"'][^\"']*(?:cover|thumb)[^\"']*[\"'][^>]+src=[\"']([^\"']+)[\"']",
+        ],
+    )
+    cover_url = urllib.parse.urljoin(_BILIMANGA_BASE, cover) if cover else ""
+    ch_pat = re.compile(
+        r"<a[^>]+href=[\"']([^\"']*(?:chapter|read|viewer|play)[^\"']*)[\"'][^>]*>(.*?)</a>",
+        re.I | re.S,
+    )
+    seen: set[str] = set()
+    chs: list[TencentChapter] = []
+    for href, label in ch_pat.findall(text):
+        cu = urllib.parse.urljoin(_BILIMANGA_BASE, href)
+        if "/detail/" in cu or "/search" in cu:
+            continue
+        if cu in seen:
+            continue
+        seen.add(cu)
+        ct = _strip_tags(label)
+        if not ct:
+            continue
+        chs.append(TencentChapter(title=ct, url=cu))
+    return TencentComicDetail(
+        comic_id=comic_id or "",
+        title=title or f"漫画 {comic_id}",
+        intro=intro,
+        cover_url=cover_url,
+        comic_url=u,
+        chapters=chs,
+    )
+
+
+def _mangacopy_extract_items(text: str, *, source: str) -> list[TencentComicItem]:
+    # 兼容常见详情页路径：/comic/<slug>、/comic/<id>、/detail/<id>
+    pat = re.compile(
+        r"<a[^>]+href=[\"']([^\"']*(?:/comic/[^\"'/\s?#]+|/detail/\d+)[^\"']*)[\"'][^>]*>(.*?)</a>",
+        re.I | re.S,
+    )
+    seen: set[str] = set()
+    out: list[TencentComicItem] = []
+    for href, label in pat.findall(text):
+        url = urllib.parse.urljoin(_MANGACOPY_BASE, href)
+        m_slug = re.search(r"/comic/([^/?#]+)", url, flags=re.I)
+        m_detail = re.search(r"/detail/(\d+)", url, flags=re.I)
+        cid = (m_slug.group(1) if m_slug else "") or (m_detail.group(1) if m_detail else "")
+        if not cid or cid in seen:
+            continue
+        title = _strip_tags(label)
+        if not title:
+            continue
+        seen.add(cid)
+        out.append(TencentComicItem(comic_id=cid, title=title, url=url, source=source))
+    return out
+
+
+def _mangacopy_hot_comics(*, limit: int = 240) -> list[TencentComicItem]:
+    seeds = [
+        _MANGACOPY_BASE,
+        f"{_MANGACOPY_BASE}rank",
+        f"{_MANGACOPY_BASE}comics",
+        f"{_MANGACOPY_BASE}newest",
+        f"{_MANGACOPY_BASE}discover",
+        f"{_MANGACOPY_BASE}recommend",
+    ]
+    max_n = max(1, int(limit))
+    seen: set[str] = set()
+    out: list[TencentComicItem] = []
+    for seed in seeds:
+        try:
+            raw = http_get(seed, timeout=20, headers=_common_html_headers(referer=_MANGACOPY_BASE))
+            text = _decode_html(raw)
+        except Exception:
+            continue
+        for it in _mangacopy_extract_items(text, source="hot"):
+            if it.comic_id in seen:
+                continue
+            seen.add(it.comic_id)
+            out.append(it)
+            if len(out) >= max_n:
+                return out
+    if not out:
+        raise BiqugeError("mangacopy 热门抓取为空")
+    return out
+
+
+def _mangacopy_search_comics(keyword: str, *, limit: int = 120) -> list[TencentComicItem]:
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    q = urllib.parse.quote(kw, safe="")
+    seeds = [
+        f"{_MANGACOPY_BASE}search?keyword={q}",
+        f"{_MANGACOPY_BASE}search?q={q}",
+        f"{_MANGACOPY_BASE}search/{q}",
+    ]
+    seen: set[str] = set()
+    out: list[TencentComicItem] = []
+    for seed in seeds:
+        try:
+            raw = http_get(seed, timeout=20, headers=_common_html_headers(referer=_MANGACOPY_BASE))
+            text = _decode_html(raw)
+        except Exception:
+            continue
+        for it in _mangacopy_extract_items(text, source="search"):
+            if it.comic_id in seen:
+                continue
+            seen.add(it.comic_id)
+            out.append(it)
+            if len(out) >= limit:
+                return out
+    if out:
+        return out[:limit]
+    # 搜索页参数可能受前端路由影响，回退到多页面本地索引过滤
+    local_pool: list[TencentComicItem] = []
+    for seed in (f"{_MANGACOPY_BASE}comics", f"{_MANGACOPY_BASE}newest", f"{_MANGACOPY_BASE}recommend", f"{_MANGACOPY_BASE}rank"):
+        try:
+            raw = http_get(seed, timeout=20, headers=_common_html_headers(referer=_MANGACOPY_BASE))
+            text = _decode_html(raw)
+            local_pool.extend(_mangacopy_extract_items(text, source="search"))
+        except Exception:
+            continue
+    if not local_pool:
+        local_pool = _mangacopy_hot_comics(limit=500)
+    seen: set[str] = set()
+    uniq_pool: list[TencentComicItem] = []
+    for it in local_pool:
+        if it.comic_id in seen:
+            continue
+        seen.add(it.comic_id)
+        uniq_pool.append(it)
+    q2 = kw.lower()
+    return [x for x in uniq_pool if q2 in x.title.lower()][:limit]
+
+
+def _mangacopy_comic_detail(comic_id_or_url: str) -> TencentComicDetail:
+    s = str(comic_id_or_url or "").strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        u = s
+    else:
+        sid = str(s).strip("/")
+        u = f"{_MANGACOPY_BASE}comic/{sid}"
+    raw = http_get(u, timeout=20, headers=_common_html_headers(referer=_MANGACOPY_BASE))
+    text = _decode_html(raw)
+    title = _first_match(
+        text,
+        [
+            r"<h1[^>]*>(.*?)</h1>",
+            r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            r"<title[^>]*>(.*?)</title>",
+        ],
+    )
+    intro = _first_match(
+        text,
+        [
+            r"<meta[^>]+name=[\"']description[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            r"<p[^>]+class=[\"'][^\"']*(?:intro|desc|summary|content)[^\"']*[\"'][^>]*>(.*?)</p>",
+            r"<div[^>]+class=[\"'][^\"']*(?:intro|desc|summary|content)[^\"']*[\"'][^>]*>(.*?)</div>",
+        ],
+    )
+    cover = _first_match(
+        text,
+        [
+            r"<meta[^>]+property=[\"']og:image[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            r"<img[^>]+src=[\"']([^\"']+)[\"'][^>]+class=[\"'][^\"']*(?:cover|thumb)[^\"']*[\"']",
+        ],
+    )
+    cover_url = urllib.parse.urljoin(_MANGACOPY_BASE, cover) if cover else ""
+    cid_m = re.search(r"/comic/([^/?#]+)", u, flags=re.I)
+    comic_id = cid_m.group(1) if cid_m else re.sub(r"\W+", "", u)[-24:]
+    ch_pat = re.compile(
+        r"<a[^>]+href=[\"']([^\"']*(?:/chapter/|/comic/[^\"']*/chapter/|/reader/)[^\"']*)[\"'][^>]*>(.*?)</a>",
+        re.I | re.S,
+    )
+    seen: set[str] = set()
+    chs: list[TencentChapter] = []
+    for href, label in ch_pat.findall(text):
+        cu = urllib.parse.urljoin(_MANGACOPY_BASE, href)
+        if cu in seen:
+            continue
+        seen.add(cu)
+        ct = _strip_tags(label)
+        if not ct:
+            continue
+        chs.append(TencentChapter(title=ct, url=cu))
+    return TencentComicDetail(
+        comic_id=comic_id,
+        title=title or "漫画",
+        intro=intro,
+        cover_url=cover_url,
+        comic_url=u,
+        chapters=chs,
+    )
+
+
+def _mkzhan_hot_comics(*, limit: int = 240) -> list[TencentComicItem]:
+    # 多入口聚合热门，尽可能多抓取并去重
+    seeds = [
+        "https://www.mkzhan.com/",
+        "https://www.mkzhan.com/update/",
+        "https://www.mkzhan.com/rank/",
+        "https://www.mkzhan.com/top/",
+    ]
     # 漫客栈漫画详情一般是 /<comic_id>/ 结构（支持相对/绝对链接）
     pat = re.compile(r"<a[^>]+href=[\"']([^\"']*/\d+/?)['\"][^>]*>(.*?)</a>", re.I | re.S)
     seen: set[str] = set()
     out: list[TencentComicItem] = []
-    for href, label in pat.findall(text):
-        url = urllib.parse.urljoin("https://www.mkzhan.com/", href)
-        m = re.search(r"https?://www\.mkzhan\.com/(\d+)/?$", url, flags=re.I)
-        if not m:
+    max_n = max(1, int(limit))
+    for seed in seeds:
+        try:
+            raw = http_get(seed, timeout=20, headers={"Referer": "https://www.mkzhan.com/"})
+            text = _decode_html(raw)
+        except Exception:
             continue
-        cid = m.group(1)
-        if cid in seen:
-            continue
-        seen.add(cid)
-        title = _strip_tags(label)
-        if not title:
-            continue
-        out.append(TencentComicItem(comic_id=cid, title=title, url=url, source="hot"))
-        if len(out) >= limit:
-            break
+        for href, label in pat.findall(text):
+            url = urllib.parse.urljoin("https://www.mkzhan.com/", href)
+            m = re.search(r"https?://www\.mkzhan\.com/(\d+)/?$", url, flags=re.I)
+            if not m:
+                continue
+            cid = m.group(1)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            title = _strip_tags(label)
+            if not title:
+                continue
+            out.append(TencentComicItem(comic_id=cid, title=title, url=url, source="hot"))
+            if len(out) >= max_n:
+                return out
     return out
 
 
@@ -360,10 +721,14 @@ def _mkzhan_comic_detail(comic_id_or_url: str) -> TencentComicDetail:
     return TencentComicDetail(comic_id=comic_id, title=title, intro=intro, cover_url=cover, comic_url=f"https://www.mkzhan.com/{comic_id}/", chapters=chs)
 
 
-def source_hot_comics(source_url: str, *, limit: int = 120) -> list[TencentComicItem]:
+def source_hot_comics(source_url: str, *, limit: int = 240) -> list[TencentComicItem]:
     st = _source_type_from_url(source_url)
     if st == "mkzhan":
         return _mkzhan_hot_comics(limit=limit)
+    if st == "bilimanga":
+        return _bilimanga_hot_comics(limit=limit)
+    if st == "mangacopy":
+        return _mangacopy_hot_comics(limit=limit)
     raise BiqugeError("当前源不支持热门列表")
 
 
@@ -380,6 +745,10 @@ def source_search_comics(source_url: str, keyword: str, *, limit: int = 120) -> 
         hot = source_hot_comics(source_url, limit=300)
         q = kw.lower()
         return [x for x in hot if q in x.title.lower()][:limit]
+    if st == "bilimanga":
+        return _bilimanga_search_comics(kw, limit=limit)
+    if st == "mangacopy":
+        return _mangacopy_search_comics(kw, limit=limit)
     raise BiqugeError("当前源不支持搜索")
 
 
@@ -387,21 +756,20 @@ def source_comic_detail(source_url: str, item: TencentComicItem) -> TencentComic
     st = _source_type_from_url(source_url)
     if st == "mkzhan":
         return _mkzhan_comic_detail(item.url or item.comic_id)
+    if st == "bilimanga":
+        return _bilimanga_comic_detail(item.url or item.comic_id)
+    if st == "mangacopy":
+        return _mangacopy_comic_detail(item.url or item.comic_id)
     raise BiqugeError("当前源不支持详情解析")
 
 
 def source_chapter_image_urls(source_url: str, chapter_url: str) -> list[str]:
     st = _source_type_from_url(source_url)
-    if st != "mkzhan":
+    if st not in {"mkzhan", "bilimanga", "mangacopy"}:
         raise BiqugeError("当前源不支持章节图片解析")
     u = str(chapter_url or "").strip()
     m = re.search(r"mkzhan\.com/(\d+)/(\d+)/?", u, flags=re.I)
-    if not m:
-        # fallback: 纯链接正则解析
-        raw = http_get(u, timeout=20, headers={"Referer": u})
-        text = _decode_html(raw)
-        urls = re.findall(r"https?://[^\"'\s>]+\.(?:jpg|jpeg|png|webp)", text, flags=re.I)
-    else:
+    if st == "mkzhan" and m:
         cid, chid = m.group(1), m.group(2)
         api = f"https://comic.mkzcdn.com/chapter/content/?comic_id={cid}&chapter_id={chid}"
         raw = http_get(api, timeout=20, headers={"Referer": f"https://www.mkzhan.com/{cid}/{chid}/"})
@@ -414,6 +782,15 @@ def source_chapter_image_urls(source_url: str, chapter_url: str) -> list[str]:
             urls = [str(x.get("image") or "").replace("http://", "https://") for x in rows if isinstance(x, dict)]
         except Exception:
             urls = re.findall(r"https?://[^\"'\s>]+\.(?:jpg|jpeg|png|webp)", text, flags=re.I)
+    else:
+        # bilimanga 及 mkzhan fallback：直接从章节页抽图
+        referer = _BILIMANGA_BASE if st == "bilimanga" else (_MANGACOPY_BASE if st == "mangacopy" else u)
+        raw = http_get(u, timeout=20, headers=_common_html_headers(referer=referer))
+        text = _decode_html(raw)
+        low = text.lower()
+        if st == "bilimanga" and ("attention required! | cloudflare" in low or "sorry, you have been blocked" in low):
+            raise BiqugeError("bilimanga 触发 Cloudflare 风控，暂无法直渲染章节")
+        urls = re.findall(r"https?://[^\"'\s>]+\.(?:jpg|jpeg|png|webp)", text, flags=re.I)
     seen: set[str] = set()
     out: list[str] = []
     for u in urls:
@@ -425,5 +802,24 @@ def source_chapter_image_urls(source_url: str, chapter_url: str) -> list[str]:
 
 
 def source_cover_headers(source_url: str, *, referer: str) -> dict[str, str]:
+    st = _source_type_from_url(source_url)
+    if st == "bilimanga":
+        return {
+            "Referer": referer or _BILIMANGA_BASE,
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+        }
+    if st == "mangacopy":
+        return {
+            "Referer": referer or _MANGACOPY_BASE,
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+        }
     return {"Referer": referer or "https://www.mkzhan.com/"}
 

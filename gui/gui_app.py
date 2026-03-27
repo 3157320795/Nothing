@@ -1172,7 +1172,19 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     cartoon_actions = tk.Frame(cartoon_top, bg=UI_BG, bd=0, highlightthickness=0)
     cartoon_actions.pack(side=tk.LEFT, padx=(0, 8))
 
-    cartoon_source_name_var = tk.StringVar(value="漫画源：漫客栈")
+    cartoon_source_map = {
+        "all": "全部源",
+        "mkzhan": "漫客栈",
+        "bilimanga": "哔哩漫画",
+        "mangacopy": "拷贝漫画",
+    }
+    cartoon_source_url_map = {
+        "mkzhan": "https://www.mkzhan.com/",
+        "bilimanga": "https://www.bilimanga.net/",
+        "mangacopy": "https://www.mangacopy.com/",
+    }
+    cartoon_source_choice_var = tk.StringVar(value=cartoon_source_map["all"])
+    cartoon_source_name_var = tk.StringVar(value=f"漫画源")
 
     cartoon_alpha_frame = tk.Frame(cartoon_top, bg=UI_BG, bd=0, highlightthickness=0)
     cartoon_alpha_frame.pack(side=tk.RIGHT, padx=(0, 8))
@@ -1253,6 +1265,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         "current_url": "",
         "loading": False,
         "source_url": "https://www.mkzhan.com/",
+        "detail_source_url": "https://www.mkzhan.com/",
         "reader_pils": [],
         "reader_photos": [],
         "showing_chapter": False,
@@ -1291,10 +1304,41 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
             total_h = y
         cartoon_cover_canvas.configure(scrollregion=(0, 0, cw, max(total_h, 200)))
 
+    def _cur_source_key() -> str:
+        selected = str(cartoon_source_choice_var.get() or cartoon_source_map["all"]).strip()
+        for k, v in cartoon_source_map.items():
+            if v == selected:
+                return k
+        return "all"
+
     def _cur_source_url() -> str:
-        s = "https://www.mkzhan.com/"
+        k = _cur_source_key()
+        s = cartoon_source_url_map.get(k, cartoon_source_url_map["mkzhan"])
         cartoon_state["source_url"] = s
+        cartoon_source_name_var.set(f"漫画源")
         return s
+
+    def _set_cartoon_source(key: str) -> None:
+        k = key if key in cartoon_source_map else "all"
+        cartoon_source_choice_var.set(cartoon_source_map[k])
+        _cur_source_url()
+        set_status(f"已切换漫画源：{cartoon_source_map[k]}")
+        cartoon_load_hot()
+
+    def _open_cartoon_source_menu(_e: Any = None) -> None:
+        m = tk.Menu(root, tearoff=0, bg=UI_BG, fg=UI_FG, bd=0, activebackground=UI_SEL_BG, activeforeground=UI_SEL_FG)
+        for key in ("all", "mkzhan", "bilimanga", "mangacopy"):
+            label = cartoon_source_map[key]
+            m.add_command(label=label, command=lambda k=key: _set_cartoon_source(k))
+        try:
+            x = cartoon_source_btn.winfo_rootx()
+            y = cartoon_source_btn.winfo_rooty() + cartoon_source_btn.winfo_height()
+            m.tk_popup(x, y)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
 
     def _cartoon_is_free_chapter(title: str) -> bool:
         t = str(title or "").strip().upper()
@@ -1366,7 +1410,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
         def worker() -> None:
             try:
-                src_url = _cur_source_url()
+                src_url = str(cartoon_state.get("detail_source_url") or _cur_source_url()).strip() or _cur_source_url()
                 img_urls = source_chapter_image_urls(src_url, chapter_url)
                 if not img_urls:
                     raise BiqugeError("未解析到可公开图片")
@@ -1411,7 +1455,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         cartoon_listbox.delete(0, tk.END)
         cartoon_state["rows"] = rows
         for i, it in enumerate(rows, start=1):
-            tag = "热门" if it.source == "hot" else "搜索"
+            tag = str(it.source or "").strip() or "未知源"
             cartoon_listbox.insert(tk.END, f"{i}. {it.title} [{tag}]")
 
     def _cartoon_draw_cover() -> None:
@@ -1498,7 +1542,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
 
         def worker() -> None:
             try:
-                src_url = _cur_source_url()
+                src_url = str(item.url or "").strip() or _cur_source_url()
                 detail = source_comic_detail(src_url, item)
                 cover_raw = b""
                 if detail.cover_url:
@@ -1515,6 +1559,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
                     cartoon_title_var.set(detail.title)
                     cartoon_intro_var.set(detail.intro or "暂无简介")
                     cartoon_state["current_url"] = detail.comic_url
+                    cartoon_state["detail_source_url"] = src_url
                     cartoon_chapter_list.delete(0, tk.END)
                     cartoon_state["reader_pils"] = []
                     cartoon_state["reader_photos"] = []
@@ -1584,23 +1629,43 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         return "break"
 
     def cartoon_load_hot() -> None:
-        src_url = _cur_source_url()
-        info = analyze_cartoon_source(src_url)
-        if info.source_type == "unknown":
-            set_status("该漫画源暂不支持，当前仅支持 https://www.mkzhan.com/")
-            return
+        src_key = _cur_source_key()
+        _cur_source_url()
         set_status("加载热门漫画中…")
 
         def worker() -> None:
             try:
-                rows = source_hot_comics(src_url, limit=120)
-                root.after(
-                    0,
-                    lambda: (
-                        _cartoon_rows_render(rows),
-                        set_status(f"[{info.source_name}] 热门已加载：{len(rows)} 条"),
-                    ),
-                )
+                if src_key == "all":
+                    merged: list[TencentComicItem] = []
+                    seen: set[str] = set()
+                    ok_sources = 0
+                    for key in ("mkzhan", "bilimanga", "mangacopy"):
+                        su = cartoon_source_url_map[key]
+                        info2 = analyze_cartoon_source(su)
+                        try:
+                            rows2 = source_hot_comics(su, limit=80)
+                        except Exception:
+                            continue
+                        for it in rows2:
+                            rid = f"{it.comic_id}|{it.url}"
+                            if rid in seen:
+                                continue
+                            seen.add(rid)
+                            merged.append(TencentComicItem(comic_id=it.comic_id, title=it.title, url=it.url, source=info2.source_name))
+                        ok_sources += 1
+                    root.after(
+                        0,
+                        lambda: (
+                            _cartoon_rows_render(merged),
+                            set_status(f"[全部源] 热门已加载：{len(merged)} 条（成功源 {ok_sources}/3）"),
+                        ),
+                    )
+                    return
+                src_url = cartoon_source_url_map.get(src_key, cartoon_source_url_map["mkzhan"])
+                info = analyze_cartoon_source(src_url)
+                rows = source_hot_comics(src_url, limit=160)
+                rows = [TencentComicItem(comic_id=x.comic_id, title=x.title, url=x.url, source=info.source_name) for x in rows]
+                root.after(0, lambda: (_cartoon_rows_render(rows), set_status(f"[{info.source_name}] 热门已加载：{len(rows)} 条")))
             except Exception as e:  # noqa: BLE001
                 err_msg = str(e)
                 root.after(0, lambda err_msg=err_msg: set_status(f"热门漫画加载失败: {err_msg}"))
@@ -1612,16 +1677,42 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         if not kw:
             set_status("请输入关键词")
             return
-        src_url = _cur_source_url()
-        info = analyze_cartoon_source(src_url)
-        if info.source_type == "unknown":
-            set_status("该漫画源暂不支持，当前仅支持 https://www.mkzhan.com/")
-            return
+        src_key = _cur_source_key()
+        _cur_source_url()
         set_status(f"搜索中: {kw}")
 
         def worker() -> None:
             try:
+                if src_key == "all":
+                    merged: list[TencentComicItem] = []
+                    seen: set[str] = set()
+                    ok_sources = 0
+                    for key in ("mkzhan", "bilimanga", "mangacopy"):
+                        su = cartoon_source_url_map[key]
+                        info2 = analyze_cartoon_source(su)
+                        try:
+                            rows2 = source_search_comics(su, kw, limit=60)
+                        except Exception:
+                            continue
+                        for it in rows2:
+                            rid = f"{it.comic_id}|{it.url}"
+                            if rid in seen:
+                                continue
+                            seen.add(rid)
+                            merged.append(TencentComicItem(comic_id=it.comic_id, title=it.title, url=it.url, source=info2.source_name))
+                        ok_sources += 1
+                    root.after(
+                        0,
+                        lambda: (
+                            _cartoon_rows_render(merged),
+                            set_status(f"[全部源] 搜索完成：{len(merged)} 条（成功源 {ok_sources}/3）"),
+                        ),
+                    )
+                    return
+                src_url = cartoon_source_url_map.get(src_key, cartoon_source_url_map["mkzhan"])
+                info = analyze_cartoon_source(src_url)
                 rows = source_search_comics(src_url, kw, limit=120)
+                rows = [TencentComicItem(comic_id=x.comic_id, title=x.title, url=x.url, source=info.source_name) for x in rows]
                 suffix = f"（{info.note}）" if info.note else ""
                 root.after(0, lambda: (_cartoon_rows_render(rows), set_status(f"[{info.source_name}] 搜索完成：{len(rows)} 条{suffix}")))
             except Exception as e:  # noqa: BLE001
@@ -1631,7 +1722,16 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
         threading.Thread(target=worker, daemon=True).start()
 
     _make_flat_button(cartoon_actions, "搜索", cartoon_search).pack(side=tk.LEFT, padx=6)
-    tk.Label(cartoon_actions, textvariable=cartoon_source_name_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(8, 6))
+    tk.Label(cartoon_actions, textvariable=cartoon_source_name_var, bg=UI_BG, fg=UI_FG).pack(side=tk.LEFT, padx=(8, 4))
+    cartoon_source_btn = tk.Label(
+        cartoon_actions,
+        textvariable=cartoon_source_choice_var,
+        bg=UI_BG,
+        fg=UI_FG,
+        padx=10,
+        pady=6,
+    )
+    cartoon_source_btn.pack(side=tk.LEFT, padx=(0, 6))
     _make_flat_button(cartoon_actions, "热门", cartoon_load_hot).pack(side=tk.LEFT, padx=6)
     _make_flat_button(cartoon_chapter_header, "开始", _cartoon_render_selected_chapter_images).pack(side=tk.RIGHT, padx=6)
 
@@ -1639,6 +1739,7 @@ def gui_app(*, out_dir: Path, prefer_redirect: bool = True, save: bool = True, t
     cartoon_chapter_list.bind("<<ListboxSelect>>", lambda _e: _cartoon_render_selected_chapter_images())
     cartoon_chapter_list.bind("<Double-Button-1>", _cartoon_open_selected_chapter)
     cartoon_kw_entry.bind("<Return>", lambda _e: cartoon_search())
+    cartoon_source_btn.bind("<Button-1>", _open_cartoon_source_menu)
     cartoon_cover_canvas.bind(
         "<Configure>",
         lambda _e: _cartoon_redraw_reader_from_cache() if cartoon_state.get("showing_chapter") else _cartoon_draw_cover(),
